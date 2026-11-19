@@ -230,8 +230,14 @@ impl WebhookRetryState {
 
     /// Calculate next retry delay using exponential backoff.
     /// Delay = min(INITIAL_BACKOFF_SECS * 2^retry_count, MAX_BACKOFF_SECS)
+    ///
+    /// The shift is checked: a `retry_count` of 64 or more (which would
+    /// overflow `u64`) yields the cap instead of panicking or wrapping.
     pub fn calculate_next_backoff(&self) -> u64 {
-        let backoff = INITIAL_BACKOFF_SECS * (1 << self.retry_count);
+        let backoff = match 1u64.checked_shl(self.retry_count) {
+            Some(factor) => INITIAL_BACKOFF_SECS.saturating_mul(factor),
+            None => return MAX_BACKOFF_SECS,
+        };
         if backoff > MAX_BACKOFF_SECS {
             MAX_BACKOFF_SECS
         } else {
@@ -339,6 +345,25 @@ mod tests {
         assert_eq!(state.calculate_next_backoff(), 16); // retry 4 → 16s (cap)
         state.retry_count = 5;
         assert_eq!(state.calculate_next_backoff(), 16); // retry 5 → 16s (cap)
+    }
+
+    #[test]
+    fn test_backoff_does_not_overflow_at_high_retry_count() {
+        let env = Env::default();
+        let mut state = WebhookRetryState::new(
+            1,
+            WebhookEventType::LoanRequested,
+            make_url(&env),
+            make_payload(&env),
+            1000,
+        );
+
+        // 1 << 64 would overflow a u64 shift; must clamp to the cap.
+        state.retry_count = 64;
+        assert_eq!(state.calculate_next_backoff(), MAX_BACKOFF_SECS);
+
+        state.retry_count = u32::MAX;
+        assert_eq!(state.calculate_next_backoff(), MAX_BACKOFF_SECS);
     }
 
     #[test]

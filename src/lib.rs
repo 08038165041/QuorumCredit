@@ -169,6 +169,7 @@ mod liquidity_farming_test;
 mod loan_cart_test;
 #[cfg(test)]
 mod repay_validation_test;
+mod loan_accrued_interest_overflow_test;
 #[cfg(test)]
 mod unimplemented_stubs_test;
 #[cfg(test)]

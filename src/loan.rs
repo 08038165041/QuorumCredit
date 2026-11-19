@@ -469,10 +469,12 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
         let outstanding_principal = (loan.amount - loan.amount_repaid).max(0);
         let new_interest =
             calculate_daily_compound_interest(outstanding_principal, days_elapsed);
+        // Issue #2068: surface overflow as ArithmeticError instead of silently
+        // saturating accrued interest to i128::MAX.
         loan.accrued_interest = loan
             .accrued_interest
             .checked_add(new_interest)
-            .unwrap_or(i128::MAX);
+            .ok_or(ContractError::ArithmeticError)?;
         // Advance the clock by whole days only; any sub-day remainder rolls
         // forward and will be picked up on the next call.
         loan.last_interest_calc += days_elapsed * SECS_PER_DAY;

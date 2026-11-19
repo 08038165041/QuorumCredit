@@ -130,17 +130,21 @@ pub fn get_referrer_by_code(env: Env, code: BytesN<32>) -> Option<Address> {
 /// referred borrower.  Looks up the referrer, computes the reward from
 /// `first_loan_interest`, deducts from the yield reserve, and pays out.
 ///
-/// This function is fire-and-forget from the caller's perspective: if the
-/// reserve is insufficient or the borrower has no referrer, it is a no-op —
-/// the caller's repayment logic is never blocked.
+/// If the reserve is insufficient or the borrower has no referrer, it is a
+/// no-op — the caller's repayment logic is never blocked.
+///
+/// Issue #2061: all arithmetic is checked. If the reward computation or any
+/// running total would overflow, `ArithmeticError` is returned instead of
+/// silently capping or wrapping the value. All overflow checks run before any
+/// storage write, so an error leaves no partial state behind.
 pub fn distribute_referral_reward(
     env: &Env,
     borrower: &Address,
     token: &Address,
     first_loan_interest: i128,
-) {
+) -> Result<(), ContractError> {
     if first_loan_interest <= 0 {
-        return;
+        return Ok(());
     }
 
     // Look up the referrer.
@@ -150,7 +154,7 @@ pub fn distribute_referral_reward(
         .get(&DataKey::ReferredBy(borrower.clone()))
     {
         Some(r) => r,
-        None => return,
+        None => return Ok(()),
     };
 
     // Compute reward.
@@ -160,9 +164,12 @@ pub fn distribute_referral_reward(
         .get(&DataKey::ReferralBonusBps)
         .unwrap_or(DEFAULT_REFERRAL_BONUS_BPS);
 
-    let reward = first_loan_interest * bonus_bps as i128 / BPS_DENOMINATOR;
+    let reward = first_loan_interest
+        .checked_mul(bonus_bps as i128)
+        .ok_or(ContractError::ArithmeticError)?
+        / BPS_DENOMINATOR;
     if reward <= 0 {
-        return;
+        return Ok(());
     }
 
     // Deduct from yield reserve — silently skip if insufficient.
@@ -172,37 +179,52 @@ pub fn distribute_referral_reward(
         .get(&DataKey::YieldReserve)
         .unwrap_or(0);
     if reserve < reward {
-        return;
+        return Ok(());
     }
-    env.storage()
-        .persistent()
-        .set(&DataKey::YieldReserve, &(reserve - reward));
+    let new_reserve = reserve
+        .checked_sub(reward)
+        .ok_or(ContractError::ArithmeticError)?;
 
-    // Pay the referrer.
-    let token_client = token::Client::new(env, token);
-    token_client.transfer(&env.current_contract_address(), &referrer, &reward);
-
-    // Update referrer's stats.
+    // Compute every updated value before any state is written.
     let mut stats = load_referral_stats(env, &referrer);
-    stats.conversion_count = stats.conversion_count.saturating_add(1);
-    stats.total_rewards_earned = stats.total_rewards_earned.saturating_add(reward);
-    stats.last_conversion_at = env.ledger().timestamp();
-    save_referral_stats(env, &stats);
-
-    // Update global referral count for the referrer.
+    let new_conversion_count = stats
+        .conversion_count
+        .checked_add(1)
+        .ok_or(ContractError::ArithmeticError)?;
+    let new_total_rewards = stats
+        .total_rewards_earned
+        .checked_add(reward)
+        .ok_or(ContractError::ArithmeticError)?;
     let count: u64 = env
         .storage()
         .persistent()
         .get(&DataKey::ReferralCount(referrer.clone()))
         .unwrap_or(0u64);
+    let new_count = count.checked_add(1).ok_or(ContractError::ArithmeticError)?;
+
+    // Pay the referrer.
+    let token_client = token::Client::new(env, token);
+    token_client.transfer(&env.current_contract_address(), &referrer, &reward);
+
     env.storage()
         .persistent()
-        .set(&DataKey::ReferralCount(referrer.clone()), &(count + 1));
+        .set(&DataKey::YieldReserve, &new_reserve);
+
+    stats.conversion_count = new_conversion_count;
+    stats.total_rewards_earned = new_total_rewards;
+    stats.last_conversion_at = env.ledger().timestamp();
+    save_referral_stats(env, &stats);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::ReferralCount(referrer.clone()), &new_count);
 
     env.events().publish(
         (symbol_short!("referral"), symbol_short!("reward")),
         (referrer, borrower.clone(), reward),
     );
+
+    Ok(())
 }
 
 /// Issue #1247: Get the referral stats for a single referrer.

@@ -144,6 +144,8 @@ mod slash_credit_score_failure_test;
 #[cfg(test)]
 mod slash_circuit_breaker_result_test;
 #[cfg(test)]
+mod repay_result_events_test;
+#[cfg(test)]
 mod vouch_panic_free_test;
 #[cfg(test)]
 mod contingent_loan_test;

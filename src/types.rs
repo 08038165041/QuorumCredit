@@ -3697,6 +3697,9 @@ pub struct GovParticipationMetrics {
 pub const GOV_PROPOSAL_THRESHOLD_BPS: i128 = 100;
 /// BPS denominator for GOV calculations.
 pub const GOV_BPS_DENOMINATOR: i128 = 10_000;
+
+/// Basis-point denominator (100% = 10_000 bps) used by fee, rate and utilization math.
+pub const BPS_DENOMINATOR: i128 = 10_000;
 /// Default DAO voting period in seconds (7 days).
 pub const DAO_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 /// Default DAO timelock after voting before execution, in seconds (2 days).

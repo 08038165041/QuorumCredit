@@ -389,11 +389,8 @@ fn repay_with_swap_inner(
     // Cap to outstanding (rounding can only push this at most one unit over)
     let effective_payment = effective_payment.min(outstanding);
 
-    // ── Pull payment_token from borrower into contract ────────────────────────
-    let src_client = token::Client::new(env, payment_token);
-    src_client.transfer(borrower, &env.current_contract_address(), &pull_amount);
-
-    // Update bridged token balance
+    // Compute the new bridged balance before moving any tokens, so an overflow
+    // aborts the call instead of leaving tokens held but unaccounted for.
     let prev_bal: i128 = env
         .storage()
         .persistent()
@@ -401,7 +398,12 @@ fn repay_with_swap_inner(
         .unwrap_or(0i128);
     let new_bal = prev_bal
         .checked_add(pull_amount)
-        .unwrap_or(prev_bal);
+        .ok_or(ContractError::ArithmeticError)?;
+
+    // ── Pull payment_token from borrower into contract ────────────────────────
+    let src_client = token::Client::new(env, payment_token);
+    src_client.transfer(borrower, &env.current_contract_address(), &pull_amount);
+
     env.storage()
         .persistent()
         .set(&DataKey::BridgedTokenBalance(payment_token.clone()), &new_bal);

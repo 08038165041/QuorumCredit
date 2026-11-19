@@ -92,3 +92,72 @@ fn test_claim_yield_does_not_delay_queued_unstake() {
     let returned = client.process_unstake(&pool_id, &staker);
     assert_eq!(returned, stake);
 }
+
+// ── #2057: rounding remainder must not be debited from the reserve ───────────
+
+#[test]
+fn test_distribute_yield_reserve_debit_matches_harvested_rewards() {
+    let (env, contract_id, admin, token) = setup();
+    let client = QuorumCreditContractClient::new(&env, &contract_id);
+    let signers = Vec::from_array(&env, [admin.clone()]);
+
+    let pool_id = client.create_staking_pool(&signers, &token);
+
+    // Large total stake so the per-token delta is not exact.
+    let staker = Address::generate(&env);
+    let stake: i128 = 1_000_000_000_000_000_007;
+    let asset = StellarAssetClient::new(&env, &token);
+    asset.mint(&staker, &stake);
+    set_time(&env, 1_000_000);
+    client.stake_capital(&pool_id, &staker, &stake);
+
+    let reserve_before: i128 = 10_000_000;
+    set_yield_reserve(&env, &contract_id, reserve_before);
+
+    // delta = floor(1e7 * 1e12 / stake) = 9, which only distributes 9_000_000.
+    let yield_amount: i128 = 10_000_000;
+    let expected_harvest: i128 = 9_000_000;
+    client.distribute_yield(&signers, &pool_id, &yield_amount);
+
+    // Only what stakers can harvest leaves the reserve; the remainder stays.
+    assert_eq!(
+        yield_reserve(&env, &contract_id),
+        reserve_before - expected_harvest
+    );
+    assert_eq!(
+        client.get_staking_pool(&pool_id).total_yield_distributed,
+        expected_harvest
+    );
+
+    // The staker's harvested reward equals the reserve debit.
+    asset.mint(&contract_id, &expected_harvest);
+    let claimed = client.claim_yield(&pool_id, &staker);
+    assert_eq!(claimed, expected_harvest);
+}
+
+#[test]
+fn test_distribute_yield_below_precision_refunds_whole_yield() {
+    let (env, contract_id, admin, token) = setup();
+    let client = QuorumCreditContractClient::new(&env, &contract_id);
+    let signers = Vec::from_array(&env, [admin.clone()]);
+
+    let pool_id = client.create_staking_pool(&signers, &token);
+
+    let staker = Address::generate(&env);
+    let stake: i128 = 1_000_000_000_000_000_007;
+    StellarAssetClient::new(&env, &token).mint(&staker, &stake);
+    set_time(&env, 1_000_000);
+    client.stake_capital(&pool_id, &staker, &stake);
+
+    let reserve_before: i128 = 10_000;
+    set_yield_reserve(&env, &contract_id, reserve_before);
+
+    // 1_000 * 1e12 / stake rounds to a delta of zero, so nothing is distributed.
+    client.distribute_yield(&signers, &pool_id, &1_000);
+
+    assert_eq!(yield_reserve(&env, &contract_id), reserve_before);
+    assert_eq!(
+        client.get_staking_pool(&pool_id).total_yield_distributed,
+        0
+    );
+}

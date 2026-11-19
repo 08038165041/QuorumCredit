@@ -119,7 +119,12 @@ fn vouch_yield_bps_uncached(env: &Env, vouch: &VouchRecord, borrower: &Address, 
         }
     }
     let unique_count = unique_borrowers.len() as i128;
-    let diversification_bonus = ((unique_count - 1) * 50).min(500);
+    // Issue #2069: an empty history contributes no bonus (previously -50).
+    let diversification_bonus = if unique_count == 0 {
+        0
+    } else {
+        ((unique_count - 1) * 50).min(500)
+    };
 
     (base_bps + age_bonus + rep_bonus + voucher_rep_bonus + reliability_bonus + diversification_bonus).max(0)
 }

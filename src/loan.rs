@@ -858,7 +858,14 @@ pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
         // than only via the manual slash path. `NoActiveLoan` just means the
         // loan was already settled/closed; any other error is ignored so a
         // read never fails because of the lazy check.
-        let _ = crate::lazy_default_detection::check_and_mark_default(&env, loan.id);
+        if let Err(err) = crate::lazy_default_detection::check_and_mark_default(&env, loan.id) {
+            if err != ContractError::NoActiveLoan {
+                env.events().publish(
+                    (Symbol::new(&env, "lazy_default"), Symbol::new(&env, "check_failed")),
+                    (loan.id, err as u32),
+                );
+            }
+        }
         if let Ok(refreshed) = get_active_loan_record(&env, &borrower) {
             return Some(refreshed);
         }
@@ -880,7 +887,14 @@ pub fn loan_status_extended(env: Env, borrower: Address) -> LoanStatusEx {
 pub fn get_loan_by_id(env: Env, loan_id: u64) -> Option<LoanRecord> {
     // Issue #2005: run the lazy default check before returning so a
     // past-deadline unpaid loan is flagged as Defaulted on read.
-    let _ = crate::lazy_default_detection::check_and_mark_default(&env, loan_id);
+    if let Err(err) = crate::lazy_default_detection::check_and_mark_default(&env, loan_id) {
+        if err != ContractError::NoActiveLoan {
+            env.events().publish(
+                (Symbol::new(&env, "lazy_default"), Symbol::new(&env, "check_failed")),
+                (loan_id, err as u32),
+            );
+        }
+    }
     env.storage().persistent().get(&DataKey::Loan(loan_id))
 }
 

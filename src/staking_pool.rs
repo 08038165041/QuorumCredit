@@ -326,8 +326,9 @@ pub fn claim_yield(
         return Err(ContractError::InsufficientFunds);
     }
 
+    // Do not touch `last_action_timestamp` here: it anchors the unstake delay
+    // enforced by `process_unstake`, and a claim must not extend a queued exit.
     position.pending_rewards = 0;
-    position.last_action_timestamp = env.ledger().timestamp();
 
     let token_client = token::Client::new(&env, &pool.token);
     token_client.transfer(&env.current_contract_address(), &staker, &rewards);

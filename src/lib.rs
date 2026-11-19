@@ -166,6 +166,8 @@ mod cross_chain_auction_test;
 #[cfg(test)]
 mod liquidity_farming_test;
 #[cfg(test)]
+mod staking_pool_test;
+#[cfg(test)]
 mod loan_cart_test;
 #[cfg(test)]
 mod repay_validation_test;

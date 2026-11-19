@@ -450,6 +450,7 @@ pub enum DataKey {
     SlashVoteQuorum, // u32 quorum in basis points (e.g. 5000 = 50%)
     ReferredBy(Address), // borrower → Address of referrer
     ReferralBonusBps, // u32 referral bonus in basis points (default 100 = 1%)
+    RecurringPaymentKeeper, // Address of the keeper allowed to record recurring-payment failures (instance)
     MaxVouchersPerBorrower, // u32 maximum number of vouchers per borrower (default 50)
     BorrowerCollateral(Address), // borrower → i128 collateral amount deposited
     BorrowerCollateralToken(Address), // borrower → Address token used for collateral

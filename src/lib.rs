@@ -127,6 +127,9 @@ mod loan_purpose_test;
 mod multi_asset_test;
 #[cfg(test)]
 mod referral_test;
+
+#[cfg(test)]
+mod recurring_payment_auth_test;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -4452,8 +4455,16 @@ impl QuorumCreditContract {
         recurring_payment::execute_recurring_payment(env, borrower)
     }
 
-    pub fn record_recurring_payment_failure(env: Env, borrower: Address) -> Result<u32, ContractError> {
-        recurring_payment::record_recurring_payment_failure(env, borrower)
+    pub fn set_recurring_payment_keeper(env: Env, admin_signers: Vec<Address>, keeper: Address) {
+        recurring_payment::set_recurring_payment_keeper(env, admin_signers, keeper)
+    }
+
+    pub fn record_recurring_payment_failure(
+        env: Env,
+        caller: Address,
+        borrower: Address,
+    ) -> Result<u32, ContractError> {
+        recurring_payment::record_recurring_payment_failure(env, caller, borrower)
     }
 
     pub fn terminate_recurring_payment(env: Env, borrower: Address) -> Result<(), ContractError> {

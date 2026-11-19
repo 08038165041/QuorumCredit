@@ -231,6 +231,10 @@ mod api_reference_test;
 mod features_test;
 #[cfg(test)]
 mod issue_2064_leave_pool_test;
+#[cfg(test)]
+mod issue_2065_fee_discount_test;
+#[cfg(test)]
+mod issue_2064_leave_pool_test;
 #[cfg(all(test, feature = "mainnet-tests"))]
 mod mainnet_deployment_test;
 #[cfg(test)]

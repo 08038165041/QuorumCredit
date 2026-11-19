@@ -530,8 +530,11 @@ pub fn apply_tier_rewards_to_fee(
         None => return base_fee_bps,
     };
 
+    // Issue #2065: multiply in u64 so a large configured discount cannot overflow u32.
+    // The discount is capped at 10,000 bps (100%) so the result never goes below zero.
     let rewards = get_tier_rewards(env.clone(), credit_score.tier);
-    let discount = base_fee_bps * rewards.fee_discount_bps as u32 / 10000;
+    let discount_bps = (rewards.fee_discount_bps as u64).min(10_000);
+    let discount = (base_fee_bps as u64 * discount_bps / 10_000) as u32;
     base_fee_bps - discount
 }
 

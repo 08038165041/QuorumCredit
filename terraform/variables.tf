@@ -121,7 +121,7 @@ variable "db_instance_class" {
   type        = string
   default     = "db.t3.large"
   validation {
-    condition     = contains(["db.t3.large", "db.t3.xlarge", "db.r5.large", "db.r5.xlarge"], var.db_instance_class)
+    condition     = contains(["db.t3.small", "db.t3.large", "db.t3.xlarge", "db.r5.large", "db.r5.xlarge"], var.db_instance_class)
     error_message = "Use production-grade instance types."
   }
 }

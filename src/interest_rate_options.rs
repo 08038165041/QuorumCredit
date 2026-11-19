@@ -148,7 +148,14 @@ pub fn calculate_premium(
     // divisor chosen so that for typical values (notional=1e10, strike=200,
     // vol=5, days=30) the premium is a few basis points of notional.
     let divisor: i128 = 10_000 * 10_000 * 100;
-    let premium = notional * strike_bps as i128 * implied_vol_bps as i128 * sqrt_days / divisor;
+    let risk_term = notional * strike_bps as i128 * implied_vol_bps as i128 * sqrt_days;
+    // Round up (ceiling division) so any positive risk term costs at least one stroop.
+    // Plain truncation let small notionals price to zero and be granted for free.
+    let premium = if risk_term > 0 {
+        (risk_term + divisor - 1) / divisor
+    } else {
+        0
+    };
 
     // Apply protocol fee on top (embed in premium).
     let fee = premium * OPTION_PROTOCOL_FEE_BPS as i128 / 10_000;
@@ -210,7 +217,7 @@ pub fn get_implied_volatility(env: &Env) -> u32 {
 /// - `token_addr`   — protocol token for premium transfer.
 ///
 /// # Errors
-/// - `InvalidAmount`    — notional ≤ 0, strike = 0, or duration = 0.
+/// - `InvalidAmount`    — notional ≤ 0, strike = 0, duration = 0, or computed premium is 0.
 /// - `ContractPaused`   — contract is paused.
 pub fn buy_option(
     env: &Env,
@@ -234,6 +241,10 @@ pub fn buy_option(
     let vol = get_implied_volatility(env);
 
     let premium = calculate_premium(notional, strike_bps, days_to_expiry, vol);
+    // A zero premium would grant an option for free; refuse it.
+    if premium <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
 
     // Transfer premium from holder to contract.
     if premium > 0 {
@@ -550,6 +561,32 @@ mod tests {
     fn test_premium_zero_for_zero_days() {
         let premium = calculate_premium(10_000_000_000, 200, 0, 5);
         assert_eq!(premium, 0);
+    }
+
+    #[test]
+    fn test_premium_rounds_up_small_notional_to_one_stroop() {
+        // Issue example: raw risk term 1_000_000 / divisor 1e8 truncates to 0.
+        // Rounding up must charge at least one stroop instead.
+        assert_eq!(calculate_premium(1_000, 200, 1, 5), 1);
+    }
+
+    #[test]
+    fn test_buy_option_rejects_zero_premium() {
+        let (env, contract_id) = make_env();
+        let holder = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Zero implied volatility makes the risk term zero, so the premium is zero.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ImpliedVolatility, &0u32);
+        });
+
+        let r = env.as_contract(&contract_id, || {
+            buy_option(&env, holder, OptionType::Call, 200, 1_000, 3600, token)
+        });
+        assert_eq!(r, Err(ContractError::InvalidAmount));
     }
 
     #[test]

@@ -63,8 +63,6 @@ pub mod prediction_market;
 pub mod reputation_nft;
 pub mod staking_pool;
 pub mod referral;
-pub mod prediction_market;
-pub mod community_treasury;
 pub mod dynamic_interest;
 pub mod governance_token;
 pub mod interest_rate_options;
@@ -136,6 +134,9 @@ mod referral_overflow_test;
 
 #[cfg(test)]
 mod referral_pending_test;
+
+#[cfg(test)]
+mod community_treasury_overflow_test;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -273,7 +273,8 @@ pub fn place_prediction(
 ///
 /// # Errors
 /// - `ProposalNotFound`        — unknown market ID.
-/// - `InvalidStateTransition`  — market is not in `PendingResolution` or `Open`.
+/// - `InvalidStateTransition`  — market is not in `PendingResolution` or `Open`,
+///   or the prediction window has not closed yet (`now < closes_at`).
 /// - `ContractPaused`          — contract is paused.
 pub fn resolve_market(
     env: &Env,
@@ -291,6 +292,13 @@ pub fn resolve_market(
         .ok_or(ContractError::ProposalNotFound)?;
 
     if market.status == MarketStatus::Resolved || market.status == MarketStatus::Cancelled {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    // A market cannot be resolved while its prediction window is still open.
+    // `resolves_at` is the oracle's target deadline, not a gate: resolution is
+    // permitted from `closes_at` onward, including before `resolves_at`.
+    if env.ledger().timestamp() < market.closes_at {
         return Err(ContractError::InvalidStateTransition);
     }
 
@@ -516,6 +524,90 @@ mod tests {
         let client = crate::QuorumCreditContractClient::new(&env, &contract_id);
         client.initialize(&deployer, &admins, &1, &token_id.address());
         (env, contract_id)
+    }
+
+    /// Like `setup()`, but also returns the registered admin address so tests
+    /// can call admin-gated entrypoints such as `resolve_market`.
+    fn setup_with_admin() -> (Env, Address, Vec<Address>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let admins = Vec::from_array(&env, [admin.clone()]);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, crate::QuorumCreditContract);
+        let client = crate::QuorumCreditContractClient::new(&env, &contract_id);
+        client.initialize(&deployer, &admins, &1, &token_id.address());
+        (env, contract_id, admins)
+    }
+
+    /// Seed an `Open` market with the given close/resolve times.
+    fn seed_open_market(env: &Env, contract_id: &Address, closes_at: u64, resolves_at: u64) {
+        let market = PredictionMarket {
+            id: 1,
+            description: make_description(env),
+            rate_threshold_bps: 300,
+            closes_at,
+            resolves_at,
+            total_yes_stake: 0,
+            total_no_stake: 0,
+            outcome: None,
+            status: MarketStatus::Open,
+        };
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(1), &market);
+        });
+    }
+
+    #[test]
+    fn test_resolve_market_rejected_before_close() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        seed_open_market(&env, &contract_id, now + 3600, now + 7200);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, true)
+        });
+        assert_eq!(result, Err(ContractError::InvalidStateTransition));
+
+        // Market must remain unresolved after the rejected attempt.
+        let market = env.as_contract(&contract_id, || get_market(&env, 1)).unwrap();
+        assert_eq!(market.status, MarketStatus::Open);
+        assert_eq!(market.outcome, None);
+    }
+
+    #[test]
+    fn test_resolve_market_allowed_at_close_boundary() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        let closes_at = now + 3600;
+        seed_open_market(&env, &contract_id, closes_at, closes_at + 3600);
+        env.ledger().set_timestamp(closes_at);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, false)
+        });
+        assert_eq!(result, Ok(()));
+        let market = env.as_contract(&contract_id, || get_market(&env, 1)).unwrap();
+        assert_eq!(market.status, MarketStatus::Resolved);
+        assert_eq!(market.outcome, Some(false));
+    }
+
+    #[test]
+    fn test_resolve_market_allowed_after_resolves_at() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        let closes_at = now + 3600;
+        let resolves_at = now + 7200;
+        seed_open_market(&env, &contract_id, closes_at, resolves_at);
+        env.ledger().set_timestamp(resolves_at + 1);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, true)
+        });
+        assert_eq!(result, Ok(()));
     }
 
     fn make_description(env: &Env) -> String {

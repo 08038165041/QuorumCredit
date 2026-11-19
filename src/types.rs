@@ -941,6 +941,7 @@ pub enum DataKey {
     ReferralCodeOwner(BytesN<32>),
     /// referrer → u32: number of successful referrals
     ReferralCount(Address),
+    PendingReferralReward(Address), // referrer → i128 reward owed but not yet paid (reserve was short)
 
     // ── Reputation badges (NFT-style achievements) ───────────────────────────
     /// (owner, badge_type) → Badge

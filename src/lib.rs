@@ -133,6 +133,9 @@ mod recurring_payment_auth_test;
 
 #[cfg(test)]
 mod referral_overflow_test;
+
+#[cfg(test)]
+mod referral_pending_test;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -5044,6 +5047,18 @@ impl QuorumCreditContract {
     /// Generate (or retrieve) a unique referral code for the caller.
     pub fn generate_referral_code(env: Env, referrer: Address) -> Result<BytesN<32>, ContractError> {
         referral::generate_referral_code(env, referrer)
+    }
+
+    pub fn get_pending_referral_reward(env: Env, referrer: Address) -> i128 {
+        referral::get_pending_referral_reward(env, referrer)
+    }
+
+    pub fn claim_pending_referral_reward(
+        env: Env,
+        referrer: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        referral::claim_pending_referral_reward(env, referrer, token)
     }
 
     /// Read a product record.

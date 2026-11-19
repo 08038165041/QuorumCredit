@@ -179,6 +179,20 @@ pub fn distribute_referral_reward(
         .get(&DataKey::YieldReserve)
         .unwrap_or(0);
     if reserve < reward {
+        // Issue #2062: record the unpaid amount so the referrer can claim it
+        // later, and emit an event so indexers can see the skip.
+        let pending = get_pending_reward(env, &referrer);
+        let new_pending = pending
+            .checked_add(reward)
+            .ok_or(ContractError::ArithmeticError)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingReferralReward(referrer.clone()), &new_pending);
+
+        env.events().publish(
+            (symbol_short!("referral"), symbol_short!("skipped")),
+            (referrer, borrower.clone(), reward, reserve),
+        );
         return Ok(());
     }
     let new_reserve = reserve
@@ -225,6 +239,64 @@ pub fn distribute_referral_reward(
     );
 
     Ok(())
+}
+
+fn get_pending_reward(env: &Env, referrer: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PendingReferralReward(referrer.clone()))
+        .unwrap_or(0)
+}
+
+/// Issue #2062: Amount of referral reward owed to `referrer` that was skipped
+/// because the yield reserve was short and has not been claimed yet.
+pub fn get_pending_referral_reward(env: Env, referrer: Address) -> i128 {
+    get_pending_reward(&env, &referrer)
+}
+
+/// Issue #2062: Pay out a referrer's pending rewards once the yield reserve
+/// can cover them. Returns the amount paid. If the reserve is still short the
+/// call fails with `InsufficientFunds` and the pending balance is kept.
+pub fn claim_pending_referral_reward(
+    env: Env,
+    referrer: Address,
+    token: Address,
+) -> Result<i128, ContractError> {
+    referrer.require_auth();
+
+    let pending = get_pending_reward(&env, &referrer);
+    if pending <= 0 {
+        return Ok(0);
+    }
+
+    let reserve: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::YieldReserve)
+        .unwrap_or(0);
+    if reserve < pending {
+        return Err(ContractError::InsufficientFunds);
+    }
+    let new_reserve = reserve
+        .checked_sub(pending)
+        .ok_or(ContractError::ArithmeticError)?;
+
+    let token_client = token::Client::new(&env, &token);
+    token_client.transfer(&env.current_contract_address(), &referrer, &pending);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::YieldReserve, &new_reserve);
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingReferralReward(referrer.clone()));
+
+    env.events().publish(
+        (symbol_short!("referral"), symbol_short!("claimed")),
+        (referrer, pending),
+    );
+
+    Ok(pending)
 }
 
 /// Issue #1247: Get the referral stats for a single referrer.

@@ -2918,6 +2918,18 @@ impl QuorumCreditContract {
         bridge::set_bridge_token_price(env, admin_signers, token_addr, price_bps)
     }
 
+    /// Admin: withdraw bridged tokens from the contract, reducing the tracked
+    /// bridged balance. Withdrawals cannot exceed the tracked balance.
+    pub fn withdraw_bridged_token(
+        env: Env,
+        admin_signers: Vec<Address>,
+        token_addr: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::withdraw_bridged_token(env, admin_signers, token_addr, recipient, amount)
+    }
+
     // ── Issue #1076: Token swap on repayment mismatch ─────────────────────────
 
     /// Repay a loan using a different token than the loan's denomination.

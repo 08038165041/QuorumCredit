@@ -217,6 +217,60 @@ pub fn set_bridge_token_price(
     Ok(())
 }
 
+/// Admin: withdraw `amount` of bridged `token_addr` held by this contract to
+/// `recipient`, decreasing the tracked bridged balance by the same amount.
+///
+/// Rule: bridged token balances are unencumbered reserves. They do not back
+/// individual loans (loan accounting is handled by `repay_with_swap` in the
+/// loan token), so the admin quorum may withdraw up to the tracked balance and
+/// no more.
+///
+/// # Errors
+///
+/// - `ContractPaused`    — contract is paused.
+/// - `InvalidAmount`     — `amount ≤ 0`.
+/// - `InsufficientFunds` — `amount` exceeds the tracked bridged balance.
+pub fn withdraw_bridged_token(
+    env: Env,
+    admin_signers: Vec<Address>,
+    token_addr: Address,
+    recipient: Address,
+    amount: i128,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+    require_admin_approval(&env, &admin_signers);
+
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let balance = get_bridged_token_balance(env.clone(), token_addr.clone());
+    if amount > balance {
+        return Err(ContractError::InsufficientFunds);
+    }
+    let new_balance = balance
+        .checked_sub(amount)
+        .ok_or(ContractError::ArithmeticError)?;
+
+    // Update the tracker before the external transfer.
+    env.storage()
+        .persistent()
+        .set(&DataKey::BridgedTokenBalance(token_addr.clone()), &new_balance);
+
+    token::Client::new(&env, &token_addr).transfer(
+        &env.current_contract_address(),
+        &recipient,
+        &amount,
+    );
+
+    env.events().publish(
+        (symbol_short!("bridge"), symbol_short!("withdraw")),
+        (token_addr, recipient, amount),
+    );
+
+    Ok(())
+}
+
 /// Query the oracle price (in basis points) for a bridge token.
 ///
 /// Returns `ContractError::InvalidToken` if no price has been configured. There
@@ -682,6 +736,75 @@ mod tests {
             get_bridged_token_balance(env.clone(), token_addr)
         });
         assert_eq!(balance, 0i128);
+    }
+
+    // ── #2108: bridged balance withdrawal ─────────────────────────────────────
+
+    #[test]
+    fn test_bridge_then_withdraw_reconciles_balance() {
+        let (env, contract_id) = make_env();
+        let (token_addr, admins) = env.as_contract(&contract_id, || {
+            let cfg = config(&env);
+            (cfg.token, cfg.admins)
+        });
+        let caller = Address::generate(&env);
+        let bridge_contract = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&caller, &1_000);
+
+        env.as_contract(&contract_id, || {
+            bridge_token(
+                env.clone(),
+                caller.clone(),
+                bridge_contract.clone(),
+                token_addr.clone(),
+                1_000,
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            env.as_contract(&contract_id, || {
+                get_bridged_token_balance(env.clone(), token_addr.clone())
+            }),
+            1_000
+        );
+
+        env.as_contract(&contract_id, || {
+            withdraw_bridged_token(
+                env.clone(),
+                admins.clone(),
+                token_addr.clone(),
+                recipient.clone(),
+                400,
+            )
+            .unwrap();
+        });
+
+        let final_balance = env.as_contract(&contract_id, || {
+            get_bridged_token_balance(env.clone(), token_addr.clone())
+        });
+        assert_eq!(final_balance, 600);
+        assert_eq!(token::Client::new(&env, &token_addr).balance(&recipient), 400);
+    }
+
+    #[test]
+    fn test_withdraw_bridged_token_rejects_amount_above_balance() {
+        let (env, contract_id) = make_env();
+        let (token_addr, admins) = env.as_contract(&contract_id, || {
+            let cfg = config(&env);
+            (cfg.token, cfg.admins)
+        });
+        let recipient = Address::generate(&env);
+        let result = env.as_contract(&contract_id, || {
+            withdraw_bridged_token(
+                env.clone(),
+                admins.clone(),
+                token_addr.clone(),
+                recipient.clone(),
+                1,
+            )
+        });
+        assert_eq!(result, Err(ContractError::InsufficientFunds));
     }
 
     // ── #1454/#1455: `repay_cross_chain_atomic` replay + reentrancy ──────────

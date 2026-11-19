@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Bytes,
-    BytesN, Env, String, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod admin;
@@ -139,6 +139,8 @@ mod rbac_enforcement_test;
 mod admin_empty_signer_test;
 #[cfg(test)]
 mod slash_result_test;
+#[cfg(test)]
+mod slash_credit_score_failure_test;
 #[cfg(test)]
 mod vouch_panic_free_test;
 #[cfg(test)]
@@ -807,8 +809,14 @@ impl QuorumCreditContract {
             ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
         }
 
-        // Update credit score after slash
-        let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
+        // Update credit score after slash. The slash must still succeed, but a
+        // failed update is surfaced as an event so the stale score is observable.
+        if let Err(err) = credit_score::update_credit_score(env.clone(), borrower.clone()) {
+            env.events().publish(
+                (Symbol::new(&env, "credit"), Symbol::new(&env, "upd_fail")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
         // Issue #1288: Decrement on-chain TVL / active-loan-count counters on slash.
         helpers::decrement_tvl_counters(&env, loan.amount);

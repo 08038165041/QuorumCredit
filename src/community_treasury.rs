@@ -404,10 +404,34 @@ pub fn finalize_proposal(
         return Ok(());
     }
 
-    // Execute: deduct from treasury balance.
+    pay_out_and_execute(env, proposal_id, &mut proposal, symbol_short!("execute"))
+}
+
+/// Transfer a passed proposal's funds to its recipient and mark it executed (issue #2107).
+///
+/// The token transfer happens before any state is written. If the transfer fails,
+/// the function returns `TreasuryTransferFailed` without touching the balance or
+/// the proposal status, so the proposal can be retried. A successful transfer
+/// decrements `TreasuryBalance` and records the payout in the monthly report.
+fn pay_out_and_execute(
+    env: &Env,
+    proposal_id: u64,
+    proposal: &mut TreasuryProposal,
+    event_topic: soroban_sdk::Symbol,
+) -> Result<(), ContractError> {
     let balance = get_treasury_balance(env);
     if proposal.amount > balance {
         return Err(ContractError::InsufficientFunds);
+    }
+
+    let transfer = crate::helpers::token(env).try_transfer(
+        &env.current_contract_address(),
+        &proposal.recipient,
+        &proposal.amount,
+    );
+    match transfer {
+        Ok(Ok(())) => {}
+        _ => return Err(ContractError::TreasuryTransferFailed),
     }
 
     env.storage()
@@ -417,13 +441,12 @@ pub fn finalize_proposal(
     proposal.status = TreasuryProposalStatus::Executed;
     env.storage()
         .persistent()
-        .set(&DataKey::TreasuryProposal(proposal_id), &proposal);
+        .set(&DataKey::TreasuryProposal(proposal_id), proposal);
 
-    // Update monthly spending report.
     update_monthly_report(env, 0, proposal.amount);
 
     env.events().publish(
-        (symbol_short!("treasury"), symbol_short!("execute")),
+        (symbol_short!("treasury"), event_topic),
         (proposal_id, proposal.recipient.clone(), proposal.amount),
     );
 
@@ -456,28 +479,7 @@ pub fn admin_approve_proposal(
         return Err(ContractError::InvalidStateTransition);
     }
 
-    let balance = get_treasury_balance(env);
-    if proposal.amount > balance {
-        return Err(ContractError::InsufficientFunds);
-    }
-
-    env.storage()
-        .persistent()
-        .set(&DataKey::TreasuryBalance, &(balance - proposal.amount));
-
-    proposal.status = TreasuryProposalStatus::Executed;
-    env.storage()
-        .persistent()
-        .set(&DataKey::TreasuryProposal(proposal_id), &proposal);
-
-    update_monthly_report(env, 0, proposal.amount);
-
-    env.events().publish(
-        (symbol_short!("treasury"), symbol_short!("adm_exec")),
-        (proposal_id, proposal.recipient.clone(), proposal.amount),
-    );
-
-    Ok(())
+    pay_out_and_execute(env, proposal_id, &mut proposal, symbol_short!("adm_exec"))
 }
 
 /// Issue #1448: Auto-reject a stale large allocation proposal.
@@ -579,6 +581,7 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::{Env, String};
+    use soroban_sdk::token::StellarAssetClient;
     use crate::types::VouchRecord;
     use crate::errors::ContractError;
 
@@ -592,6 +595,8 @@ mod tests {
         let contract_id = env.register_contract(None, crate::QuorumCreditContract);
         let client = crate::QuorumCreditContractClient::new(&env, &contract_id);
         client.initialize(&deployer, &admins, &1, &token_id.address());
+        // Fund the contract with real tokens so payouts can transfer (issue #2107).
+        StellarAssetClient::new(&env, &token_id.address()).mint(&contract_id, &1_000_000_000_000);
         let proposer = Address::generate(&env);
         (env, contract_id, proposer)
     }
@@ -1088,5 +1093,71 @@ mod tests {
         let voter = seeded_voter_with_stake(&env, &contract_id, 7_000_000);
         let weight = env.as_contract(&contract_id, || voter_vouched_stake(&env, &voter)).unwrap();
         assert_eq!(weight, 7_000_000);
+    }
+
+    // ── Issue #2107: passed proposals pay the recipient ─────────────────────
+
+    #[test]
+    fn test_execution_transfers_funds_to_recipient() {
+        let (env, contract_id, proposer) = setup();
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        let recipient = Address::generate(&env);
+        let id = env
+            .as_contract(&contract_id, || {
+                create_proposal(&env, proposer, recipient.clone(), 100_000, String::from_str(&env, "Grant"))
+            })
+            .unwrap();
+        for _ in 0..3 {
+            let voter = seeded_voter(&env, &contract_id);
+            env.as_contract(&contract_id, || vote_on_proposal(&env, voter, id, true).unwrap());
+        }
+        env.ledger().with_mut(|l| l.timestamp += TREASURY_VOTING_PERIOD_SECS + 1);
+        env.as_contract(&contract_id, || finalize_proposal(&env, id).unwrap());
+
+        let token = env.as_contract(&contract_id, || crate::helpers::config(&env).token);
+        let recipient_balance = soroban_sdk::token::Client::new(&env, &token).balance(&recipient);
+        assert_eq!(recipient_balance, 100_000);
+
+        let p = env.as_contract(&contract_id, || get_treasury_proposal(&env, id)).unwrap();
+        assert_eq!(p.status, TreasuryProposalStatus::Executed);
+        assert_eq!(env.as_contract(&contract_id, || get_treasury_balance(&env)), 900_000);
+    }
+
+    #[test]
+    fn test_failed_payout_leaves_balance_and_status_unchanged() {
+        let (env, contract_id, proposer) = setup();
+        // Treasury ledger claims more than the contract actually holds in tokens,
+        // so the transfer cannot succeed.
+        let contract_token_holding = 1_000_000_000_000_i128;
+        let claimed_balance = contract_token_holding * 2;
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::TreasuryBalance, &claimed_balance);
+        });
+        let recipient = Address::generate(&env);
+        // Above the 30% threshold, so the proposal routes through admin approval.
+        let amount = contract_token_holding + 1;
+        let id = env
+            .as_contract(&contract_id, || {
+                create_proposal(&env, proposer, recipient, amount, String::from_str(&env, "Big grant"))
+            })
+            .unwrap();
+        for _ in 0..3 {
+            let voter = seeded_voter(&env, &contract_id);
+            env.as_contract(&contract_id, || vote_on_proposal(&env, voter, id, true).unwrap());
+        }
+        env.ledger().with_mut(|l| l.timestamp += TREASURY_VOTING_PERIOD_SECS + 1);
+        env.as_contract(&contract_id, || finalize_proposal(&env, id).unwrap());
+
+        let admin = Address::generate(&env);
+        let result = env.as_contract(&contract_id, || {
+            admin_approve_proposal(&env, Vec::from_array(&env, [admin]), id)
+        });
+        assert_eq!(result, Err(ContractError::TreasuryTransferFailed));
+
+        let p = env.as_contract(&contract_id, || get_treasury_proposal(&env, id)).unwrap();
+        assert_eq!(p.status, TreasuryProposalStatus::PendingAdminApproval);
+        assert_eq!(env.as_contract(&contract_id, || get_treasury_balance(&env)), claimed_balance);
     }
 }

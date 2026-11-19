@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -91,9 +92,27 @@ def load_history(history_path: str) -> list[dict]:
 
 
 def save_history(history_path: str, history: list[dict], max_entries: int) -> None:
+    """Atomically replace the history file.
+
+    The payload is written to a temporary file in the same directory, flushed
+    to disk, and then moved over the target with ``os.replace``. A crash or
+    kill mid-write leaves the previous file intact instead of a truncated one.
+    """
     trimmed = history[-max_entries:]
-    with open(history_path, "w") as f:
-        json.dump(trimmed, f, indent=2)
+    directory = os.path.dirname(os.path.abspath(history_path))
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=".state_history.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(trimmed, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, history_path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def detect_anomalies(

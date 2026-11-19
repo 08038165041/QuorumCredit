@@ -418,14 +418,26 @@ pub fn claim_payout(
             Some(true) => market.total_yes_stake,
             _ => market.total_no_stake,
         };
-        let total_pot = market.total_yes_stake + market.total_no_stake;
+        let total_pot = market
+            .total_yes_stake
+            .checked_add(market.total_no_stake)
+            .ok_or(ContractError::ArithmeticError)?;
 
         if winning_stake == 0 {
             0
         } else {
-            let gross = position.stake * total_pot / winning_stake;
-            let fee = gross * PREDICTION_MARKET_FEE_BPS as i128 / 10_000;
-            let net = gross - fee;
+            // Checked arithmetic: with `overflow-checks = true` a plain `*`
+            // would panic and abort the transaction on a large pot.
+            let gross = position
+                .stake
+                .checked_mul(total_pot)
+                .and_then(|v| v.checked_div(winning_stake))
+                .ok_or(ContractError::ArithmeticError)?;
+            let fee = gross
+                .checked_mul(PREDICTION_MARKET_FEE_BPS as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(ContractError::ArithmeticError)?;
+            let net = gross.checked_sub(fee).ok_or(ContractError::ArithmeticError)?;
 
             // Accumulate fee to treasury.
             crate::community_treasury::deposit_to_treasury(env, fee);
@@ -559,6 +571,47 @@ mod tests {
                 .persistent()
                 .set(&DataKey::PredictionMarket(1), &market);
         });
+    }
+
+    #[test]
+    fn test_claim_payout_overflow_returns_arithmetic_error() {
+        let (env, contract_id) = setup();
+        let market_id = 1u64;
+        let now = env.ledger().timestamp();
+        let huge = i128::MAX / 2;
+        let market = PredictionMarket {
+            id: market_id,
+            description: make_description(&env),
+            rate_threshold_bps: 300,
+            closes_at: now + 3600,
+            resolves_at: now + 7200,
+            total_yes_stake: huge,
+            total_no_stake: 0,
+            outcome: Some(true),
+            status: MarketStatus::Resolved,
+        };
+        let participant = Address::generate(&env);
+        let token = Address::generate(&env);
+        let position = MarketPosition {
+            participant: participant.clone(),
+            side: PredictionSide::Yes,
+            stake: huge,
+            claimed: false,
+        };
+
+        // stake * total_pot overflows i128; must surface as ArithmeticError,
+        // not a panic that aborts the transaction.
+        let result = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(market_id), &market);
+            env.storage().persistent().set(
+                &DataKey::MarketPosition(market_id, participant.clone()),
+                &position,
+            );
+            claim_payout(&env, participant.clone(), market_id, token)
+        });
+        assert_eq!(result, Err(ContractError::ArithmeticError));
     }
 
     #[test]

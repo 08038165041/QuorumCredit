@@ -580,6 +580,8 @@ EmergencyBypassNotAuthorised = 131,
     CooldownBypassReasonTooLong = 266,
     /// Cooldown bypass request or approval has passed its validity window.
     CooldownBypassExpired = 267,
+    /// Voter has no active vouched stake and cannot vote on treasury proposals.
+    NoVouchedStake = 269,
     /// Cross-collateral pool not found.
     CollateralPoolNotFound = 132,
     /// Cross-collateral pool is already active (has an assigned borrower).

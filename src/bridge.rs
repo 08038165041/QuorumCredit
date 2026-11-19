@@ -253,7 +253,11 @@ pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> Result<i128, C
 /// # Errors
 ///
 /// - `NoActiveLoan`       — borrower has no active or defaulted loan.
-/// - `InvalidAmount`      — `payment_amount ≤ 0` or would exceed outstanding balance.
+/// - `InvalidAmount`      — `payment_amount ≤ 0`.
+///
+/// Overpayments are not an error: only the amount needed to clear the
+/// outstanding balance is transferred from the borrower, so the excess stays
+/// with the borrower.
 /// - `InvalidToken`       — `payment_token` is not an allowed token.
 /// - `InsufficientFunds`  — converted amount is zero (price oracle returned bad data).
 /// - `ContractPaused`     — contract is paused.
@@ -363,12 +367,31 @@ fn repay_with_swap_inner(
         .unwrap_or(0)
         .max(0);
 
-    // Cap converted_amount to outstanding (no overpayment)
-    let effective_payment = converted_amount.min(outstanding);
+    // ── Pull only what the loan needs, so overpayments are never taken ────────
+    // Amount of payment_token needed to clear `outstanding` in loan_token terms,
+    // rounded up so the borrower never pays less than the balance owed.
+    let needed_payment = outstanding
+        .checked_mul(loan_token_price)
+        .ok_or(ContractError::ArithmeticError)?
+        .checked_add(payment_token_price - 1)
+        .ok_or(ContractError::ArithmeticError)?
+        / payment_token_price;
+    let pull_amount = payment_amount.min(needed_payment);
+
+    if pull_amount <= 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let effective_payment = pull_amount
+        .checked_mul(payment_token_price)
+        .ok_or(ContractError::ArithmeticError)?
+        / loan_token_price;
+    // Cap to outstanding (rounding can only push this at most one unit over)
+    let effective_payment = effective_payment.min(outstanding);
 
     // ── Pull payment_token from borrower into contract ────────────────────────
     let src_client = token::Client::new(env, payment_token);
-    src_client.transfer(borrower, &env.current_contract_address(), &payment_amount);
+    src_client.transfer(borrower, &env.current_contract_address(), &pull_amount);
 
     // Update bridged token balance
     let prev_bal: i128 = env
@@ -377,7 +400,7 @@ fn repay_with_swap_inner(
         .get(&DataKey::BridgedTokenBalance(payment_token.clone()))
         .unwrap_or(0i128);
     let new_bal = prev_bal
-        .checked_add(payment_amount)
+        .checked_add(pull_amount)
         .unwrap_or(prev_bal);
     env.storage()
         .persistent()
@@ -388,7 +411,7 @@ fn repay_with_swap_inner(
         (
             borrower.clone(),
             payment_token.clone(),
-            payment_amount,
+            pull_amount,
             loan_token.clone(),
             effective_payment,
         ),

@@ -4758,6 +4758,11 @@ impl QuorumCreditContract {
         prediction_market::resolve_market(&env, admin_signers, market_id, outcome)
     }
 
+    /// Move a prediction market past its close time to `PendingResolution`.
+    pub fn close_prediction_market(env: Env, market_id: u64) -> Result<(), ContractError> {
+        prediction_market::close_market(&env, market_id)
+    }
+
     /// Cancel a prediction market and allow refunds (admin only).
     pub fn cancel_prediction_market(
         env: Env,

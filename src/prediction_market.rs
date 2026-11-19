@@ -219,12 +219,11 @@ pub fn place_prediction(
         return Err(ContractError::VotingPeriodEnded);
     }
 
+    // Past the close time the call is refused without writing anything. Soroban
+    // rolls back all storage writes made by a failing call, so a status change
+    // made here would never persist. Use `close_market` to record the transition.
     let now = env.ledger().timestamp();
     if now >= market.closes_at {
-        market.status = MarketStatus::PendingResolution;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PredictionMarket(market_id), &market);
         return Err(ContractError::VotingPeriodEnded);
     }
 
@@ -304,6 +303,46 @@ pub fn resolve_market(
         (symbol_short!("market"), symbol_short!("resolve")),
         (market_id, outcome),
     );
+
+    Ok(())
+}
+
+/// Move an open market whose prediction window has closed to `PendingResolution`.
+///
+/// Anyone may call this once `closes_at` has passed. It is a separate
+/// entrypoint because `place_prediction` must return an error after close, and
+/// that error rolls back any status write made in the same call.
+///
+/// # Errors
+/// - `ProposalNotFound`       — unknown market ID.
+/// - `InvalidStateTransition` — market is not open, or the window is still open.
+/// - `ContractPaused`         — contract is paused.
+pub fn close_market(env: &Env, market_id: u64) -> Result<(), ContractError> {
+    require_not_paused(env)?;
+
+    let mut market: PredictionMarket = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PredictionMarket(market_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if market.status == MarketStatus::PendingResolution {
+        return Ok(());
+    }
+    if market.status != MarketStatus::Open {
+        return Err(ContractError::InvalidStateTransition);
+    }
+    if env.ledger().timestamp() < market.closes_at {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    market.status = MarketStatus::PendingResolution;
+    env.storage()
+        .persistent()
+        .set(&DataKey::PredictionMarket(market_id), &market);
+
+    env.events()
+        .publish((symbol_short!("market"), symbol_short!("closed")), market_id);
 
     Ok(())
 }
@@ -582,6 +621,47 @@ mod tests {
             place_prediction(&env, participant, market_id, PredictionSide::Yes, 0, token)
         });
         assert_eq!(result, Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_close_market_persists_transition_after_refused_prediction() {
+        let (env, contract_id) = setup();
+        let market_id = 1u64;
+        let now = env.ledger().timestamp();
+        let market = PredictionMarket {
+            id: market_id,
+            description: make_description(&env),
+            rate_threshold_bps: 300,
+            closes_at: now + 3600,
+            resolves_at: now + 7200,
+            total_yes_stake: 0,
+            total_no_stake: 0,
+            outcome: None,
+            status: MarketStatus::Open,
+        };
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(market_id), &market);
+        });
+
+        // Advance past closes_at, then try to predict. The call is refused.
+        env.ledger().set_timestamp(now + 3601);
+        let participant = Address::generate(&env);
+        let token = Address::generate(&env);
+        let result = env.as_contract(&contract_id, || {
+            place_prediction(&env, participant, market_id, PredictionSide::Yes, 1000, token)
+        });
+        assert_eq!(result, Err(ContractError::VotingPeriodEnded));
+
+        // The refused call wrote nothing, so the market is still Open.
+        let status = env.as_contract(&contract_id, || get_market(&env, market_id).unwrap().status);
+        assert_eq!(status, MarketStatus::Open);
+
+        // close_market records the transition, and it is visible through get_market.
+        env.as_contract(&contract_id, || close_market(&env, market_id).unwrap());
+        let status = env.as_contract(&contract_id, || get_market(&env, market_id).unwrap().status);
+        assert_eq!(status, MarketStatus::PendingResolution);
     }
 
     #[test]

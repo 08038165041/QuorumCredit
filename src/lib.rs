@@ -349,7 +349,8 @@ impl QuorumCreditContract {
         stake: i128,
         token: Address,
     ) -> Result<(), ContractError> {
-        vouch::vouch(env, voucher, borrower, stake, token)
+        // Issue #2100: the entrypoint targets native Stellar (chain_id = None -> 0).
+        vouch::vouch(env, voucher, borrower, stake, token, None)
     }
 
     pub fn increase_stake(
@@ -5159,30 +5160,43 @@ impl QuorumCreditContract {
     pub fn initialize_loan_covenants(
         env: Env,
         borrower: Address,
-        loan_amount: i128,
-        collateral_value: i128,
-        income: i128,
+        covenant_types: Vec<crate::types::CovenantType>,
+        ltv_ratio_bps: u32,
+        dti_ratio_bps: u32,
+        min_activity_per_period: u32,
+        collateral_maintenance_bps: u32,
+        monitoring_period_secs: u64,
+        breach_tolerance: u32,
     ) -> Result<(), ContractError> {
+        // Issue #2100: the module is keyed by loan ID, so resolve the borrower's
+        // active loan. A borrower without an active loan gets `NoActiveLoan`.
+        let loan = helpers::get_active_loan_record(&env, &borrower)?;
         covenant_monitoring::initialize_loan_covenants(
             &env,
-            &borrower,
-            loan_amount,
-            collateral_value,
-            income,
+            loan.id,
+            covenant_types,
+            ltv_ratio_bps,
+            dti_ratio_bps,
+            min_activity_per_period,
+            collateral_maintenance_bps,
+            monitoring_period_secs,
+            breach_tolerance,
         )
     }
 
     /// Issue #2001: Re-evaluate all covenants for a borrower's active loan.
     ///
     /// Should be called periodically (or by a keeper) during the loan lifecycle.
-    /// Returns the list of covenant breaches detected; an empty list means all
+    /// Returns the loan's covenant status; `breach_count` is zero when all
     /// covenants (LTV, DTI, PaymentSchedule, ActivityRequirement,
     /// CollateralMaintenance, CrossDefault) are satisfied.
     pub fn monitor_loan_covenants(
         env: Env,
         borrower: Address,
-    ) -> Result<Vec<covenant_monitoring::CovenantBreach>, ContractError> {
-        covenant_monitoring::monitor_loan_covenants(&env, &borrower)
+    ) -> Result<crate::types::LoanCovenantStatus, ContractError> {
+        // Issue #2100: resolve the borrower to its active loan ID.
+        let loan = helpers::get_active_loan_record(&env, &borrower)?;
+        covenant_monitoring::monitor_loan_covenants(&env, loan.id)
     }
 
     // ── Issue #2002: Quorum Slice Migration ───────────────────────────────────

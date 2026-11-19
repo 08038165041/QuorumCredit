@@ -29,7 +29,7 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Env, Vec};
 
 use crate::errors::ContractError;
-use crate::helpers::require_not_paused;
+use crate::helpers::{require_allowed_token, require_not_paused};
 use crate::types::DataKey;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -464,13 +464,16 @@ pub fn purchase_badge(
         return Err(ContractError::InvalidAmount);
     }
 
+    // Only tokens on the contract allowlist may settle a purchase.
+    let token_client = require_allowed_token(env, &token)?;
+
     // Enforce on-chain payment: buyer must send at least the listing price.
     if payment_amount < badge.listing_price {
         return Err(ContractError::InsufficientFunds);
     }
 
     // Transfer payment from buyer to seller on-chain.
-    soroban_sdk::token::Client::new(env, &token).transfer(&buyer, &seller, &payment_amount);
+    token_client.transfer(&buyer, &seller, &payment_amount);
 
     // Remove badge from seller.
     env.storage().persistent().remove(&key);
@@ -632,6 +635,38 @@ mod tests {
             let b = get_badge(&env, &buyer, BadgeType::TopVoucher).unwrap();
             assert_eq!(b.owner, buyer);
             assert!(!b.listed_for_sale);
+        });
+    }
+
+    #[test]
+    fn test_purchase_badge_rejects_disallowed_token() {
+        let (env, contract_id, seller, _token_address) = setup();
+        let buyer = Address::generate(&env);
+
+        // A token the contract has never allowlisted, minted freely by the buyer.
+        let rogue_token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &rogue_token).mint(&buyer, &500_000i128);
+
+        env.as_contract(&contract_id, || {
+            mint_badge(&env, &seller, BadgeType::TopVoucher);
+            list_badge_for_sale(&env, seller.clone(), BadgeType::TopVoucher, 500_000).unwrap();
+            let result = purchase_badge(
+                &env,
+                buyer.clone(),
+                seller.clone(),
+                BadgeType::TopVoucher,
+                rogue_token.clone(),
+                500_000i128,
+            );
+            assert_eq!(result, Err(ContractError::InvalidToken));
+        });
+
+        env.as_contract(&contract_id, || {
+            // Badge stays with the seller; nothing was transferred.
+            assert!(get_badge(&env, &seller, BadgeType::TopVoucher).is_some());
+            assert!(get_badge(&env, &buyer, BadgeType::TopVoucher).is_none());
         });
     }
 

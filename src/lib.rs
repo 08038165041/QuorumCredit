@@ -71,6 +71,7 @@ pub mod interest_rate_options;
 pub mod loan_attribution;
 pub mod loyalty;
 pub mod liquidity_mining;
+pub mod liquidity_farming;
 // Issue #110 — circuit breaker for webhook delivery
 pub mod webhook_retry;
 // Issue #111 — max webhook subscriptions per caller

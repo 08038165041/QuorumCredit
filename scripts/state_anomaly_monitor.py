@@ -28,6 +28,7 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, asdict
+from typing import Callable
 
 
 @dataclass
@@ -84,11 +85,33 @@ def fetch_snapshot(config: dict) -> StateSnapshot:
     )
 
 
-def load_history(history_path: str) -> list[dict]:
+def load_history(
+    history_path: str, on_quarantine: Callable[[str], None] | None = None
+) -> list[dict]:
+    """Load history, quarantining an unreadable file instead of crashing.
+
+    If the file is not valid JSON, it is moved aside to
+    ``<history_path>.corrupt-<unix_ts>`` so the next run can start fresh, an
+    empty history is returned, and ``on_quarantine`` (if given) is called with
+    a human-readable message so the condition can be alerted on.
+    """
     if not os.path.exists(history_path):
         return []
-    with open(history_path) as f:
-        return json.load(f)
+    try:
+        with open(history_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        quarantine_path = f"{history_path}.corrupt-{int(time.time())}"
+        os.replace(history_path, quarantine_path)
+        message = (
+            f"history file {history_path} was corrupt ({exc}); "
+            f"moved to {quarantine_path} and starting with empty history"
+        )
+        if on_quarantine is not None:
+            on_quarantine(message)
+        else:
+            print(f"WARNING: {message}", file=sys.stderr)
+        return []
 
 
 def save_history(history_path: str, history: list[dict], max_entries: int) -> None:
@@ -261,7 +284,10 @@ def main() -> int:
         print(f"Failed to fetch state snapshot: {exc}", file=sys.stderr)
         return 2
 
-    history = load_history(history_path)
+    def alert_on_quarantine(message: str) -> None:
+        send_alert(message, config, args.dry_run)
+
+    history = load_history(history_path, on_quarantine=alert_on_quarantine)
 
     if args.report_only:
         print(generate_daily_report(snapshot, history))

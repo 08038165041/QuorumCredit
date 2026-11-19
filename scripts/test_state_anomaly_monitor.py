@@ -225,6 +225,26 @@ class TestStateAnomalyMonitor(unittest.TestCase):
             self.assertEqual(load_history(path), original)
             self.assertEqual(os.listdir(tmpdir), ["state_history.json"])
 
+    def test_load_history_quarantines_corrupt_file_and_alerts(self):
+        """A corrupt history file is moved aside, history starts empty, and an alert is raised."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "state_history.json")
+            with open(path, "w") as f:
+                f.write('[{"captured_at": "2026-08-30T00:00')  # truncated JSON
+
+            alerts: list[str] = []
+            history = load_history(path, on_quarantine=alerts.append)
+
+            self.assertEqual(history, [])
+            self.assertFalse(os.path.exists(path))
+            quarantined = [n for n in os.listdir(tmpdir) if n.startswith("state_history.json.corrupt-")]
+            self.assertEqual(len(quarantined), 1)
+            with open(os.path.join(tmpdir, quarantined[0])) as f:
+                self.assertIn("captured_at", f.read())
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("was corrupt", alerts[0])
+            self.assertIn(quarantined[0], alerts[0])
+
     # ── Sybil Simulation & Shared Fixture Integration Tests ────────────────────
 
     def test_state_anomaly_monitor_flags_sybil_loan_spam_attack(self):

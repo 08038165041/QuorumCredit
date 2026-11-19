@@ -54,6 +54,14 @@ pub const MAX_FLASH_LOAN_AMOUNT: i128 = 1_000_000_000_000; // 100,000 XLM
 /// Minimum flash loan amount
 pub const MIN_FLASH_LOAN_AMOUNT: i128 = 1_000_000; // 0.1 XLM
 
+/// Maximum number of flash loan records kept in the hot `FlashLoanHistory`.
+/// Older records are moved to per-period archive buckets, not dropped.
+pub const FLASH_LOAN_HISTORY_MAX_RECORDS: u32 = 10_000;
+
+/// Length of one archive period, in seconds. Evicted records are grouped into
+/// buckets keyed by `timestamp / FLASH_LOAN_ARCHIVE_PERIOD_SECS` (one day).
+pub const FLASH_LOAN_ARCHIVE_PERIOD_SECS: u64 = 86_400;
+
 /// Minimum interval, in ledger seconds, required between two flash loans to
 /// the same `callback_contract`. Bounds how fast a single caller can spam
 /// flash loans regardless of amount.
@@ -397,10 +405,14 @@ fn add_flash_loan_record(env: &Env, record: &FlashLoanRecord) -> Result<(), Cont
 
     records.push_back(record.clone());
 
-    // Keep only last 10000 records to avoid unbounded growth
-    if records.len() > 10000 {
-        // Archive old records (would archive to separate storage in production)
-        records.pop_front();
+    // Keep only the newest FLASH_LOAN_HISTORY_MAX_RECORDS in the hot history.
+    // Evicted records move to a per-period archive bucket. Aggregate figures
+    // live in FlashLoanStats and are never derived from history, so archival
+    // does not change them.
+    while records.len() > FLASH_LOAN_HISTORY_MAX_RECORDS {
+        if let Some(old) = records.pop_front() {
+            archive_flash_loan_record(env, &old);
+        }
     }
 
     env.storage()
@@ -408,6 +420,26 @@ fn add_flash_loan_record(env: &Env, record: &FlashLoanRecord) -> Result<(), Cont
         .set(&DataKey::FlashLoanHistory, &records);
 
     Ok(())
+}
+
+fn archive_flash_loan_record(env: &Env, record: &FlashLoanRecord) {
+    let period = record.timestamp / FLASH_LOAN_ARCHIVE_PERIOD_SECS;
+    let key = DataKey::FlashLoanArchive(period);
+    let mut bucket: Vec<FlashLoanRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(&env));
+    bucket.push_back(record.clone());
+    env.storage().persistent().set(&key, &bucket);
+}
+
+/// Archived flash loan records for one period (`timestamp / FLASH_LOAN_ARCHIVE_PERIOD_SECS`).
+pub fn get_flash_loan_archive(env: &Env, period: u64) -> Vec<FlashLoanRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FlashLoanArchive(period))
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 fn update_flash_loan_stats(env: &Env, amount: i128, fee: i128) -> Result<(), ContractError> {
@@ -697,6 +729,62 @@ mod tests {
 
         env.as_contract(&contract_id, || {
             assert!(check_flash_loan_cooldown(&env, &callback).is_ok());
+        });
+    }
+
+    #[test]
+    fn test_archiving_history_leaves_stats_unchanged() {
+        // Filling the hot history past its cap moves the oldest record into the
+        // period archive. FlashLoanStats totals must be identical before and
+        // after that eviction.
+        let env = Env::default();
+        // Seeding the full history is a large write; lift the test budget.
+        env.cost_estimate().budget().reset_unlimited();
+        let (contract_id, _admin, token) = setup_contract(&env);
+        let borrower = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            let seed = FlashLoanRecord {
+                borrower: borrower.clone(),
+                amount: 100,
+                fee: 1,
+                timestamp: 0,
+                token: token.clone(),
+            };
+            let mut full: Vec<FlashLoanRecord> = Vec::new(&env);
+            for _ in 0..FLASH_LOAN_HISTORY_MAX_RECORDS {
+                full.push_back(seed.clone());
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::FlashLoanHistory, &full);
+
+            update_flash_loan_stats(&env, 100, 1).unwrap();
+            let before = get_flash_loan_stats(&env).unwrap();
+
+            let newest = FlashLoanRecord {
+                timestamp: 1,
+                amount: 200,
+                ..seed.clone()
+            };
+            add_flash_loan_record(&env, &newest).unwrap();
+
+            let after = get_flash_loan_stats(&env).unwrap();
+            assert_eq!(after.total_volume, before.total_volume);
+            assert_eq!(after.total_fees, before.total_fees);
+            assert_eq!(after.loan_count, before.loan_count);
+            assert_eq!(after.period_fees, before.period_fees);
+
+            let history: Vec<FlashLoanRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::FlashLoanHistory)
+                .unwrap();
+            assert_eq!(history.len(), FLASH_LOAN_HISTORY_MAX_RECORDS);
+
+            let archived = get_flash_loan_archive(&env, 0);
+            assert_eq!(archived.len(), 1);
+            assert_eq!(archived.get(0).unwrap().amount, 100);
         });
     }
 

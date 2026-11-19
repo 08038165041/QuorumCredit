@@ -218,12 +218,15 @@ pub fn set_bridge_token_price(
 }
 
 /// Query the oracle price (in basis points) for a bridge token.
-/// Returns `10_000` (1:1 parity) if no price has been set.
-pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> i128 {
+///
+/// Returns `ContractError::InvalidToken` if no price has been configured. There
+/// is deliberately no parity fallback: a token without an explicit price must
+/// never be convertible at face value.
+pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> Result<i128, ContractError> {
     env.storage()
         .persistent()
         .get(&DataKey::BridgeTokenPrice(token_addr.clone()))
-        .unwrap_or(10_000i128)
+        .ok_or(ContractError::InvalidToken)
 }
 
 // ── Issue #1076: Token swap on repayment mismatch ─────────────────────────────
@@ -333,8 +336,8 @@ fn repay_with_swap_inner(
     // ── Price conversion: payment_token → loan_token ─────────────────────────
     // Oracle prices are stored in basis points relative to a common denominator.
     // converted = payment_amount * payment_token_price / loan_token_price
-    let payment_token_price = get_bridge_token_price(env, payment_token);
-    let loan_token_price = get_bridge_token_price(env, &loan_token);
+    let payment_token_price = get_bridge_token_price(env, payment_token)?;
+    let loan_token_price = get_bridge_token_price(env, &loan_token)?;
 
     if loan_token_price == 0 {
         return Err(ContractError::InsufficientFunds);
@@ -624,14 +627,26 @@ mod tests {
     // ── #1075: Bridge token price ─────────────────────────────────────────────
 
     #[test]
-    fn test_get_bridge_token_price_default_is_parity() {
+    fn test_get_bridge_token_price_missing_is_error() {
         let (env, contract_id) = make_env();
         let token_addr = Address::generate(&env);
-        // Default price is 10_000 bps (1:1)
+        // No price configured → error, never a 1:1 parity fallback
         let price = env.as_contract(&contract_id, || {
             get_bridge_token_price(&env, &token_addr)
         });
-        assert_eq!(price, 10_000);
+        assert_eq!(price, Err(ContractError::InvalidToken));
+    }
+
+    #[test]
+    fn test_get_bridge_token_price_returns_configured_value() {
+        let (env, contract_id) = make_env();
+        let token_addr = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::BridgeTokenPrice(token_addr.clone()), &5_000i128);
+            assert_eq!(get_bridge_token_price(&env, &token_addr), Ok(5_000));
+        });
     }
 
     #[test]

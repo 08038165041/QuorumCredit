@@ -3567,10 +3567,17 @@ pub enum LoanMilestone {
 }
 
 impl LoanMilestone {
-    /// Fraction of a voucher's stake released when this milestone is reached,
-    /// expressed in basis points. Each milestone releases 25% (2_500 bps).
+    /// Fraction of a voucher's original stake released when this milestone is
+    /// reached, in basis points. Issue #2118: the schedule sums to 10_000 bps
+    /// (100%) across all milestones. `Issued` is a disbursement event, not a
+    /// repayment, so it releases nothing.
     pub fn release_bps(&self) -> u32 {
-        2_500
+        match self {
+            LoanMilestone::Issued => 0,
+            LoanMilestone::FirstPaymentMade => 2_500,
+            LoanMilestone::HalfRepaid => 2_500,
+            LoanMilestone::Completed => 5_000,
+        }
     }
 
     /// Stable numeric discriminant used as a storage-key component.

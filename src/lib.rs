@@ -79,6 +79,9 @@ pub mod covenant_monitoring;
 // Issue #2003 — dynamic rebalancing of quorum slices (admin/keeper triggered).
 // Issue #2004 — attestor specialization records, written on registration.
 pub mod attestor_specialization;
+// Issue #2103 — attestor performance/SLA tracking. Internal only: not exposed as
+// contract entrypoints yet; compiled so its tests run.
+mod attestor_performance_contracts;
 
 // ── Issues #1738–#1741: SBT features ─────────────────────────────────────────
 // Issue #1738 — SBT Reputation System

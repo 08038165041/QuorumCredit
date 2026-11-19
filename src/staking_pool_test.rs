@@ -161,3 +161,73 @@ fn test_distribute_yield_below_precision_refunds_whole_yield() {
         0
     );
 }
+
+// ── #2058: accumulator overflow must be reported, not saturated ──────────────
+
+fn set_accumulator(env: &Env, contract_id: &Address, pool_id: u64, value: i128) {
+    env.as_contract(contract_id, || {
+        let mut pool: StakingPool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingPool(pool_id))
+            .unwrap();
+        pool.yield_per_token_scaled = value;
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingPool(pool_id), &pool);
+    });
+}
+
+#[test]
+fn test_distribute_yield_at_accumulator_max_returns_overflow() {
+    let (env, contract_id, admin, token) = setup();
+    let client = QuorumCreditContractClient::new(&env, &contract_id);
+    let signers = Vec::from_array(&env, [admin.clone()]);
+
+    let pool_id = client.create_staking_pool(&signers, &token);
+
+    let staker = Address::generate(&env);
+    let stake: i128 = 1_000;
+    StellarAssetClient::new(&env, &token).mint(&staker, &stake);
+    set_time(&env, 1_000_000);
+    client.stake_capital(&pool_id, &staker, &stake);
+
+    let reserve_before: i128 = 10_000;
+    set_yield_reserve(&env, &contract_id, reserve_before);
+    set_accumulator(&env, &contract_id, pool_id, i128::MAX - 1);
+
+    // delta = 10 * 1e12 / 1000 = 1e10, which pushes the accumulator past i128::MAX.
+    let result = client.try_distribute_yield(&signers, &pool_id, &10);
+    assert!(matches!(result, Err(Ok(ContractError::ArithmeticOverflow))));
+
+    // A failed distribution must not debit the reserve.
+    assert_eq!(yield_reserve(&env, &contract_id), reserve_before);
+    assert_eq!(
+        client.get_staking_pool(&pool_id).yield_per_token_scaled,
+        i128::MAX - 1
+    );
+}
+
+#[test]
+fn test_apply_loss_at_accumulator_min_returns_overflow() {
+    let (env, contract_id, admin, token) = setup();
+    let client = QuorumCreditContractClient::new(&env, &contract_id);
+    let signers = Vec::from_array(&env, [admin.clone()]);
+
+    let pool_id = client.create_staking_pool(&signers, &token);
+
+    let staker = Address::generate(&env);
+    let stake: i128 = 1_000;
+    StellarAssetClient::new(&env, &token).mint(&staker, &stake);
+    set_time(&env, 1_000_000);
+    client.stake_capital(&pool_id, &staker, &stake);
+
+    set_accumulator(&env, &contract_id, pool_id, i128::MIN + 1);
+
+    // loss_delta = 10 * 1e12 / 1000 = 1e10, which underflows the accumulator.
+    let result = client.try_apply_staking_pool_loss(&signers, &pool_id, &10);
+    assert!(matches!(result, Err(Ok(ContractError::ArithmeticOverflow))));
+
+    // The pool's stake must be unchanged after the rejected loss.
+    assert_eq!(client.get_staking_pool(&pool_id).total_staked, stake);
+}

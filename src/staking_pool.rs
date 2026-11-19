@@ -34,6 +34,10 @@ use crate::types::{
     YIELD_PER_TOKEN_PRECISION,
 };
 
+/// Accumulator value at or above which a `pool/accWarn` event is emitted, so
+/// operators can see the yield-per-token accumulator nearing `i128::MAX`.
+const ACCUMULATOR_WARN_THRESHOLD: i128 = i128::MAX / 2;
+
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 fn load_pool(env: &Env, pool_id: u64) -> Result<StakingPool, ContractError> {
@@ -403,11 +407,22 @@ pub fn distribute_yield(
         .ok_or(ContractError::ArithmeticOverflow)?
         / YIELD_PER_TOKEN_PRECISION;
 
+    let new_accumulator = pool
+        .yield_per_token_scaled
+        .checked_add(delta)
+        .ok_or(ContractError::ArithmeticOverflow)?;
+
     env.storage()
         .persistent()
         .set(&DataKey::YieldReserve, &(reserve - distributed));
 
-    pool.yield_per_token_scaled = pool.yield_per_token_scaled.saturating_add(delta);
+    pool.yield_per_token_scaled = new_accumulator;
+    if pool.yield_per_token_scaled >= ACCUMULATOR_WARN_THRESHOLD {
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("accWarn")),
+            (pool_id, pool.yield_per_token_scaled),
+        );
+    }
     pool.total_yield_distributed = pool.total_yield_distributed.saturating_add(distributed);
 
     // Recalculate APY: annualised yield / total staked, in basis points.
@@ -473,7 +488,10 @@ pub fn apply_staking_pool_loss(
         .ok_or(ContractError::ArithmeticOverflow)?
         / pool.total_staked;
 
-    pool.yield_per_token_scaled = pool.yield_per_token_scaled.saturating_sub(loss_delta);
+    pool.yield_per_token_scaled = pool
+        .yield_per_token_scaled
+        .checked_sub(loss_delta)
+        .ok_or(ContractError::ArithmeticOverflow)?;
     pool.total_staked = pool.total_staked.saturating_sub(loss_amount);
 
     save_pool(&env, &pool);

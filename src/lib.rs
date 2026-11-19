@@ -63,14 +63,8 @@ pub mod prediction_market;
 pub mod reputation_nft;
 pub mod staking_pool;
 pub mod referral;
-pub mod prediction_market;
-pub mod community_treasury;
 pub mod dynamic_interest;
-pub mod governance_token;
-pub mod interest_rate_options;
-pub mod loan_attribution;
 pub mod loyalty;
-pub mod liquidity_mining;
 // Issue #110 — circuit breaker for webhook delivery
 pub mod webhook_retry;
 // Issue #111 — max webhook subscriptions per caller
@@ -82,9 +76,7 @@ pub mod attestor_analytics;
 // each `monitor_loan_covenants` call during the loan lifecycle.
 pub mod covenant_monitoring;
 // Issue #2002 — migration of borrowers/credentials between quorum slices.
-pub mod quorum_slice_migration;
 // Issue #2003 — dynamic rebalancing of quorum slices (admin/keeper triggered).
-pub mod quorum_slice_rebalancing;
 // Issue #2004 — attestor specialization records, written on registration.
 pub mod attestor_specialization;
 
@@ -115,7 +107,6 @@ pub mod field_permissions;
 // Issue #1617 — Quorum Slice Transparency Index
 pub mod transparency;
 // Issue #1633 — Credential Audit Trail Compression
-pub mod audit_trail_compression;
 
 #[cfg(test)]
 mod governance_test;

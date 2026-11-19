@@ -236,11 +236,7 @@ mod issue_2065_fee_discount_test;
 #[cfg(test)]
 mod issue_2066_decay_test;
 #[cfg(test)]
-mod issue_2064_leave_pool_test;
-#[cfg(test)]
-mod issue_2065_fee_discount_test;
-#[cfg(test)]
-mod issue_2064_leave_pool_test;
+mod issue_2067_loyalty_principal_test;
 #[cfg(all(test, feature = "mainnet-tests"))]
 mod mainnet_deployment_test;
 #[cfg(test)]

@@ -142,6 +142,8 @@ mod slash_result_test;
 #[cfg(test)]
 mod slash_credit_score_failure_test;
 #[cfg(test)]
+mod slash_circuit_breaker_result_test;
+#[cfg(test)]
 mod vouch_panic_free_test;
 #[cfg(test)]
 mod contingent_loan_test;
@@ -828,12 +830,19 @@ impl QuorumCreditContract {
 
         // Issue #1371: check the circuit breaker after each executed slash using
         // real running default/loan counters instead of never calling it.
-        let _ = circuit_breaker::try_trigger_circuit_breaker(
+        if let Err(err) = circuit_breaker::try_trigger_circuit_breaker(
             &env,
             &cfg,
             helpers::get_total_default_count(&env),
             helpers::get_total_loan_count(&env),
-        );
+        ) {
+            // The slash completes, but a breaker failure must not be silent: surface it
+            // so operators know automatic protection did not engage.
+            env.events().publish(
+                (Symbol::new(&env, "circuit_breaker"), Symbol::new(&env, "failed")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
         Ok(())
     }

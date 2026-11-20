@@ -48,6 +48,14 @@ interface EventData {
   transactionHash: string;
 }
 
+/** An event that could not be parsed, kept with its raw payload for replay (#2129). */
+interface DeadLetter {
+  ledger: number;
+  recordedAt: number;
+  error: string;
+  raw: unknown;
+}
+
 interface CursorData {
   lastProcessedLedger: number;
   lastUpdated: number;
@@ -401,9 +409,37 @@ class EventIndexer extends EventEmitter {
         };
       } catch (error) {
         console.error('Error parsing event:', error);
+        // Keep the raw event so it can be replayed. This is written before any cursor
+        // save, so the cursor cannot move past an unrecorded failure (#2129).
+        this.recordDeadLetter(event, error);
         return null;
       }
     }).filter(event => event !== null) as EventData[];
+  }
+
+  /**
+   * Append an unparseable event to the dead-letter file (#2129).
+   *
+   * Reads the file first, so earlier dead letters survive a restart.
+   */
+  private recordDeadLetter(event: any, error: unknown): void {
+    const filePath = `${this.dbPath}.deadletter.json`;
+    let entries: DeadLetter[] = [];
+    try {
+      if (fs.existsSync(filePath)) {
+        entries = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      }
+    } catch (readError) {
+      console.error('Error reading dead-letter file:', readError);
+    }
+    entries.push({
+      ledger: Number(event?.ledger),
+      recordedAt: Date.now(),
+      error: error instanceof Error ? error.message : String(error),
+      raw: event,
+    });
+    fs.writeFileSync(`${filePath}.tmp`, JSON.stringify(entries, null, 2));
+    fs.renameSync(`${filePath}.tmp`, filePath);
   }
 
   /**

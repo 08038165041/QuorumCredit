@@ -126,14 +126,20 @@ pub fn get_treasury_balance(env: &Env) -> i128 {
 /// Deposit `amount` stroops into the community treasury (internal helper).
 ///
 /// Called automatically whenever the protocol fee treasury is topped up.
-pub fn deposit_to_treasury(env: &Env, amount: i128) {
+///
+/// Issue #2063: the balance addition is checked. Overflow returns
+/// `ArithmeticError` and leaves the stored balance unchanged.
+pub fn deposit_to_treasury(env: &Env, amount: i128) -> Result<(), ContractError> {
     if amount <= 0 {
-        return;
+        return Ok(());
     }
     let balance = get_treasury_balance(env);
+    let new_balance = balance
+        .checked_add(amount)
+        .ok_or(ContractError::ArithmeticError)?;
     env.storage()
         .persistent()
-        .set(&DataKey::TreasuryBalance, &(balance + amount));
+        .set(&DataKey::TreasuryBalance, &new_balance);
 
     env.events().publish(
         (symbol_short!("treasury"), symbol_short!("deposit")),
@@ -142,6 +148,7 @@ pub fn deposit_to_treasury(env: &Env, amount: i128) {
 
     // Update monthly report.
     update_monthly_report(env, amount, 0);
+    Ok(())
 }
 
 // ── Proposal Lifecycle ────────────────────────────────────────────────────────
@@ -637,7 +644,7 @@ mod tests {
     #[test]
     fn test_deposit_increases_balance() {
         let (env, contract_id, _) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let balance = env.as_contract(&contract_id, || get_treasury_balance(&env));
         assert_eq!(balance, 1_000_000);
     }
@@ -645,7 +652,7 @@ mod tests {
     #[test]
     fn test_create_proposal_requires_positive_amount() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let result = env.as_contract(&contract_id, || {
             create_proposal(&env, proposer, recipient, -1, String::from_str(&env, "bad"))
@@ -656,7 +663,7 @@ mod tests {
     #[test]
     fn test_create_proposal_succeeds() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -680,7 +687,7 @@ mod tests {
     #[test]
     fn test_vote_and_finalize_proposal() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -723,7 +730,7 @@ mod tests {
     #[test]
     fn test_rejected_proposal_when_no_quorum() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -756,7 +763,7 @@ mod tests {
     #[test]
     fn test_cannot_vote_twice() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -781,7 +788,7 @@ mod tests {
     #[test]
     fn test_monthly_report_updated_on_deposit() {
         let (env, contract_id, _) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 500_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 500_000).unwrap());
         let month_id = env.ledger().timestamp() / (30 * 24 * 60 * 60);
         let report = env
             .as_contract(&contract_id, || get_treasury_report(&env, month_id))
@@ -793,7 +800,7 @@ mod tests {
     fn test_auto_reject_stale_large_allocation() {
         // Issue #1448: Test auto-rejection of stale proposals
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000).unwrap());
         let recipient = Address::generate(&env);
 
         // Create a large allocation (exceeds threshold)
@@ -850,7 +857,7 @@ mod tests {
     fn test_cannot_auto_reject_before_deadline() {
         // Issue #1448: Auto-rejection should fail before deadline
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000).unwrap());
         let recipient = Address::generate(&env);
 
         let id = env
@@ -891,7 +898,7 @@ mod tests {
     fn test_admin_can_approve_before_deadline() {
         // Issue #1448: Admin approval before deadline should succeed
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 10_000_000).unwrap());
         let recipient = Address::generate(&env);
 
         let id = env
@@ -942,7 +949,7 @@ mod tests {
     #[test]
     fn test_create_proposal_rejects_amount_above_balance() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000).unwrap());
         let recipient = Address::generate(&env);
         let result = env.as_contract(&contract_id, || {
             create_proposal(&env, proposer, recipient, 1_001, String::from_str(&env, "Too big"))
@@ -968,7 +975,7 @@ mod tests {
     #[test]
     fn test_finalize_before_voting_ends_is_rejected() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -982,7 +989,7 @@ mod tests {
     #[test]
     fn test_finalize_twice_is_rejected() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {
@@ -1008,7 +1015,7 @@ mod tests {
     #[test]
     fn test_execution_fails_when_treasury_cannot_cover_allocation() {
         let (env, contract_id, proposer) = setup();
-        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000));
+        env.as_contract(&contract_id, || deposit_to_treasury(&env, 1_000_000).unwrap());
         let recipient = Address::generate(&env);
         let id = env
             .as_contract(&contract_id, || {

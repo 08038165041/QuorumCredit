@@ -482,7 +482,7 @@ pub fn claim_payout(
             let net = gross.checked_sub(fee).ok_or(ContractError::ArithmeticError)?;
 
             // Accumulate fee to treasury.
-            crate::community_treasury::deposit_to_treasury(env, fee);
+            crate::community_treasury::deposit_to_treasury(env, fee)?;
 
             net
         }

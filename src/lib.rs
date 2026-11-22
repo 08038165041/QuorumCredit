@@ -121,6 +121,18 @@ mod loan_purpose_test;
 mod multi_asset_test;
 #[cfg(test)]
 mod referral_test;
+
+#[cfg(test)]
+mod recurring_payment_auth_test;
+
+#[cfg(test)]
+mod referral_overflow_test;
+
+#[cfg(test)]
+mod referral_pending_test;
+
+#[cfg(test)]
+mod community_treasury_overflow_test;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -512,6 +524,43 @@ impl QuorumCreditContract {
     ) -> Result<(), ContractError> {
         voucher.require_auth();
 
+        let token_client = crate::helpers::require_allowed_token(&env, &token)?;
+        let voucher_balance = token_client.balance(&voucher);
+        let balance_ok = voucher_balance >= stake_amount;
+        let blacklisted = crate::admin::is_blacklisted(env.clone(), borrower.clone());
+
+        zk_snarks::verify_vouch_proof(&env, &proof, &voucher, &borrower, &token, stake_amount, balance_ok, blacklisted)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::VouchCommitment(voucher.clone(), borrower.clone()), &commitment);
+
+        let proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ZkProofCounter)
+            .unwrap_or(0u64)
+            .checked_add(1)
+            .expect("proof ID overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ZkProofCounter, &proof_id);
+
+        let proof_record = crate::types::ZkProofRecord {
+            proof_id,
+            proof: proof.clone(),
+            operation_type: crate::types::PROOF_TYPE_VOUCH,
+            submitter: voucher.clone(),
+            verified: true,
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkProofRecord(proof_id), &proof_record);
+
+        vouch::vouch(env, voucher, borrower, stake_amount, token, chain_id)
+    }
+
     pub fn pause(env: Env, admin_signers: Vec<Address>) {
         admin::pause(env, admin_signers)
     }
@@ -526,9 +575,6 @@ impl QuorumCreditContract {
     }
 
     // ── Admin & Config ────────────────────────────────────────────────────────
-
-        vouch::vouch(env, voucher, borrower, stake_amount, token, chain_id)
-    }
 
     /// Settlement-time reveal for a confidential vouch commitment recorded by
     /// `vouch_confidential()`. Verifies that `amount`/`blinding` hash to the commitment
@@ -4466,8 +4512,16 @@ impl QuorumCreditContract {
         recurring_payment::execute_recurring_payment(env, borrower)
     }
 
-    pub fn record_recurring_payment_failure(env: Env, borrower: Address) -> Result<u32, ContractError> {
-        recurring_payment::record_recurring_payment_failure(env, borrower)
+    pub fn set_recurring_payment_keeper(env: Env, admin_signers: Vec<Address>, keeper: Address) {
+        recurring_payment::set_recurring_payment_keeper(env, admin_signers, keeper)
+    }
+
+    pub fn record_recurring_payment_failure(
+        env: Env,
+        caller: Address,
+        borrower: Address,
+    ) -> Result<u32, ContractError> {
+        recurring_payment::record_recurring_payment_failure(env, caller, borrower)
     }
 
     pub fn terminate_recurring_payment(env: Env, borrower: Address) -> Result<(), ContractError> {
@@ -5049,6 +5103,18 @@ impl QuorumCreditContract {
     /// Generate (or retrieve) a unique referral code for the caller.
     pub fn generate_referral_code(env: Env, referrer: Address) -> Result<BytesN<32>, ContractError> {
         referral::generate_referral_code(env, referrer)
+    }
+
+    pub fn get_pending_referral_reward(env: Env, referrer: Address) -> i128 {
+        referral::get_pending_referral_reward(env, referrer)
+    }
+
+    pub fn claim_pending_referral_reward(
+        env: Env,
+        referrer: Address,
+        token: Address,
+    ) -> Result<i128, ContractError> {
+        referral::claim_pending_referral_reward(env, referrer, token)
     }
 
     /// Read a product record.

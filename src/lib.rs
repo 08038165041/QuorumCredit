@@ -65,6 +65,7 @@ pub mod staking_pool;
 pub mod referral;
 pub mod dynamic_interest;
 pub mod loyalty;
+pub mod liquidity_farming;
 // Issue #110 — circuit breaker for webhook delivery
 pub mod webhook_retry;
 // Issue #111 — max webhook subscriptions per caller
@@ -185,6 +186,8 @@ mod cross_chain_governance_test;
 mod cross_chain_auction_test;
 #[cfg(test)]
 mod liquidity_farming_test;
+#[cfg(test)]
+mod staking_pool_test;
 #[cfg(test)]
 mod loan_cart_test;
 #[cfg(test)]

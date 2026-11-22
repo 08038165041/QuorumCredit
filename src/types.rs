@@ -892,6 +892,9 @@ pub enum DataKey {
     FlashLoanPerContractCap(Address),
     /// Recent flash loan activity records (bounded ring buffer)
     FlashLoanHistory,
+    /// period index (timestamp / FLASH_LOAN_ARCHIVE_PERIOD_SECS) → Vec<FlashLoanRecord>:
+    /// flash loan records evicted from FlashLoanHistory, bucketed by period
+    FlashLoanArchive(u64),
     /// contract → u64: ledger timestamp of that contract's last flash loan
     FlashLoanLastTimestamp(Address),
     /// contract → bool: whether this callback contract is allowed to receive flash loans
@@ -3191,7 +3194,17 @@ pub struct CooldownBypassRequest {
     pub requested_at: u64,
     pub approvers: Vec<Address>,
     pub approved: bool,
+    /// Ledger timestamp after which the bypass can no longer be voted on or used.
+    /// Set to `requested_at + COOLDOWN_BYPASS_VALIDITY_SECS` on request and
+    /// reset to `approved_at + COOLDOWN_BYPASS_VALIDITY_SECS` when approval is reached.
+    pub expires_at: u64,
 }
+
+/// Validity window for an approved cooldown bypass (issue #2104).
+pub const COOLDOWN_BYPASS_VALIDITY_SECS: u64 = 24 * 60 * 60;
+
+/// Maximum byte length accepted for the free-text `reason` on a cooldown bypass request (issue #2104).
+pub const MAX_COOLDOWN_BYPASS_REASON_LEN: u32 = 256;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

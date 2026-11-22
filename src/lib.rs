@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Bytes,
-    BytesN, Env, String, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod admin;
@@ -63,14 +63,8 @@ pub mod prediction_market;
 pub mod reputation_nft;
 pub mod staking_pool;
 pub mod referral;
-pub mod prediction_market;
-pub mod community_treasury;
 pub mod dynamic_interest;
-pub mod governance_token;
-pub mod interest_rate_options;
-pub mod loan_attribution;
 pub mod loyalty;
-pub mod liquidity_mining;
 // Issue #110 — circuit breaker for webhook delivery
 pub mod webhook_retry;
 // Issue #111 — max webhook subscriptions per caller
@@ -82,11 +76,12 @@ pub mod attestor_analytics;
 // each `monitor_loan_covenants` call during the loan lifecycle.
 pub mod covenant_monitoring;
 // Issue #2002 — migration of borrowers/credentials between quorum slices.
-pub mod quorum_slice_migration;
 // Issue #2003 — dynamic rebalancing of quorum slices (admin/keeper triggered).
-pub mod quorum_slice_rebalancing;
 // Issue #2004 — attestor specialization records, written on registration.
 pub mod attestor_specialization;
+// Issue #2103 — attestor performance/SLA tracking. Internal only: not exposed as
+// contract entrypoints yet; compiled so its tests run.
+mod attestor_performance_contracts;
 
 // ── Issues #1738–#1741: SBT features ─────────────────────────────────────────
 // Issue #1738 — SBT Reputation System
@@ -115,7 +110,6 @@ pub mod field_permissions;
 // Issue #1617 — Quorum Slice Transparency Index
 pub mod transparency;
 // Issue #1633 — Credential Audit Trail Compression
-pub mod audit_trail_compression;
 
 #[cfg(test)]
 mod governance_test;
@@ -138,7 +132,19 @@ mod rbac_enforcement_test;
 #[cfg(test)]
 mod admin_empty_signer_test;
 #[cfg(test)]
+mod cooldown_bypass_expiry_test;
+#[cfg(test)]
+mod slash_quorum_overflow_test;
+#[cfg(test)]
 mod slash_result_test;
+#[cfg(test)]
+mod slash_credit_score_failure_test;
+#[cfg(test)]
+mod slash_circuit_breaker_result_test;
+#[cfg(test)]
+mod repay_result_events_test;
+#[cfg(test)]
+mod lazy_default_result_test;
 #[cfg(test)]
 mod vouch_panic_free_test;
 #[cfg(test)]
@@ -169,6 +175,10 @@ mod liquidity_farming_test;
 mod loan_cart_test;
 #[cfg(test)]
 mod repay_validation_test;
+mod sbt_stake_not_unlocked_test;
+mod weighted_stake_overflow_test;
+mod diversification_empty_history_test;
+mod loan_accrued_interest_overflow_test;
 #[cfg(test)]
 mod unimplemented_stubs_test;
 #[cfg(test)]
@@ -360,7 +370,8 @@ impl QuorumCreditContract {
         stake: i128,
         token: Address,
     ) -> Result<(), ContractError> {
-        vouch::vouch(env, voucher, borrower, stake, token)
+        // Issue #2100: the entrypoint targets native Stellar (chain_id = None -> 0).
+        vouch::vouch(env, voucher, borrower, stake, token, None)
     }
 
     pub fn increase_stake(
@@ -809,8 +820,14 @@ impl QuorumCreditContract {
             ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
         }
 
-        // Update credit score after slash
-        let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
+        // Update credit score after slash. The slash must still succeed, but a
+        // failed update is surfaced as an event so the stale score is observable.
+        if let Err(err) = credit_score::update_credit_score(env.clone(), borrower.clone()) {
+            env.events().publish(
+                (Symbol::new(&env, "credit"), Symbol::new(&env, "upd_fail")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
         // Issue #1288: Decrement on-chain TVL / active-loan-count counters on slash.
         helpers::decrement_tvl_counters(&env, loan.amount);
@@ -822,12 +839,19 @@ impl QuorumCreditContract {
 
         // Issue #1371: check the circuit breaker after each executed slash using
         // real running default/loan counters instead of never calling it.
-        let _ = circuit_breaker::try_trigger_circuit_breaker(
+        if let Err(err) = circuit_breaker::try_trigger_circuit_breaker(
             &env,
             &cfg,
             helpers::get_total_default_count(&env),
             helpers::get_total_loan_count(&env),
-        );
+        ) {
+            // The slash completes, but a breaker failure must not be silent: surface it
+            // so operators know automatic protection did not engage.
+            env.events().publish(
+                (Symbol::new(&env, "circuit_breaker"), Symbol::new(&env, "failed")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
         Ok(())
     }
@@ -2920,6 +2944,18 @@ impl QuorumCreditContract {
         bridge::set_bridge_token_price(env, admin_signers, token_addr, price_bps)
     }
 
+    /// Admin: withdraw bridged tokens from the contract, reducing the tracked
+    /// bridged balance. Withdrawals cannot exceed the tracked balance.
+    pub fn withdraw_bridged_token(
+        env: Env,
+        admin_signers: Vec<Address>,
+        token_addr: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        bridge::withdraw_bridged_token(env, admin_signers, token_addr, recipient, amount)
+    }
+
     // ── Issue #1076: Token swap on repayment mismatch ─────────────────────────
 
     /// Repay a loan using a different token than the loan's denomination.
@@ -3293,6 +3329,8 @@ impl QuorumCreditContract {
         voucher: Address,
     ) -> Result<diversification::DiversificationScore, ContractError> {
         diversification::calculate_diversification_score(&env, &voucher)
+    }
+
     // ── Issue #1631 / #1929: Credential Field-Level Permissions ──────────────
 
     /// Set the access permission (0=Public, 1=Private, 2=ReadOnly, 3=Hidden) for a
@@ -4727,6 +4765,7 @@ impl QuorumCreditContract {
         rate_threshold_bps: u32,
         closes_at: u64,
         resolves_at: u64,
+        token_addr: Address,
     ) -> Result<u64, ContractError> {
         prediction_market::create_market(
             &env,
@@ -4735,19 +4774,19 @@ impl QuorumCreditContract {
             rate_threshold_bps,
             closes_at,
             resolves_at,
+            token_addr,
         )
     }
 
-    /// Place a prediction on an open market.
+    /// Place a prediction on an open market. The stake is paid in the market's token.
     pub fn place_market_prediction(
         env: Env,
         participant: Address,
         market_id: u64,
         side: prediction_market::PredictionSide,
         stake: i128,
-        token_addr: Address,
     ) -> Result<(), ContractError> {
-        prediction_market::place_prediction(&env, participant, market_id, side, stake, token_addr)
+        prediction_market::place_prediction(&env, participant, market_id, side, stake)
     }
 
     /// Oracle resolves a prediction market (admin only).
@@ -4760,6 +4799,11 @@ impl QuorumCreditContract {
         prediction_market::resolve_market(&env, admin_signers, market_id, outcome)
     }
 
+    /// Move a prediction market past its close time to `PendingResolution`.
+    pub fn close_prediction_market(env: Env, market_id: u64) -> Result<(), ContractError> {
+        prediction_market::close_market(&env, market_id)
+    }
+
     /// Cancel a prediction market and allow refunds (admin only).
     pub fn cancel_prediction_market(
         env: Env,
@@ -4769,14 +4813,13 @@ impl QuorumCreditContract {
         prediction_market::cancel_market(&env, admin_signers, market_id)
     }
 
-    /// Claim payout for a winning prediction.
+    /// Claim payout for a winning prediction, paid in the market's token.
     pub fn claim_prediction_payout(
         env: Env,
         participant: Address,
         market_id: u64,
-        token_addr: Address,
     ) -> Result<i128, ContractError> {
-        prediction_market::claim_payout(&env, participant, market_id, token_addr)
+        prediction_market::claim_payout(&env, participant, market_id)
     }
 
     /// Return a prediction market by ID.
@@ -4885,7 +4928,7 @@ impl QuorumCreditContract {
         notional: i128,
         strike_bps: u32,
         duration_secs: u64,
-    ) -> i128 {
+    ) -> Result<i128, ContractError> {
         let days = (duration_secs / interest_rate_options::SECS_PER_DAY).max(1);
         let vol = interest_rate_options::get_implied_volatility(&env);
         interest_rate_options::calculate_premium(notional, strike_bps, days, vol)
@@ -5170,30 +5213,43 @@ impl QuorumCreditContract {
     pub fn initialize_loan_covenants(
         env: Env,
         borrower: Address,
-        loan_amount: i128,
-        collateral_value: i128,
-        income: i128,
+        covenant_types: Vec<crate::types::CovenantType>,
+        ltv_ratio_bps: u32,
+        dti_ratio_bps: u32,
+        min_activity_per_period: u32,
+        collateral_maintenance_bps: u32,
+        monitoring_period_secs: u64,
+        breach_tolerance: u32,
     ) -> Result<(), ContractError> {
+        // Issue #2100: the module is keyed by loan ID, so resolve the borrower's
+        // active loan. A borrower without an active loan gets `NoActiveLoan`.
+        let loan = helpers::get_active_loan_record(&env, &borrower)?;
         covenant_monitoring::initialize_loan_covenants(
             &env,
-            &borrower,
-            loan_amount,
-            collateral_value,
-            income,
+            loan.id,
+            covenant_types,
+            ltv_ratio_bps,
+            dti_ratio_bps,
+            min_activity_per_period,
+            collateral_maintenance_bps,
+            monitoring_period_secs,
+            breach_tolerance,
         )
     }
 
     /// Issue #2001: Re-evaluate all covenants for a borrower's active loan.
     ///
     /// Should be called periodically (or by a keeper) during the loan lifecycle.
-    /// Returns the list of covenant breaches detected; an empty list means all
+    /// Returns the loan's covenant status; `breach_count` is zero when all
     /// covenants (LTV, DTI, PaymentSchedule, ActivityRequirement,
     /// CollateralMaintenance, CrossDefault) are satisfied.
     pub fn monitor_loan_covenants(
         env: Env,
         borrower: Address,
-    ) -> Result<Vec<covenant_monitoring::CovenantBreach>, ContractError> {
-        covenant_monitoring::monitor_loan_covenants(&env, &borrower)
+    ) -> Result<crate::types::LoanCovenantStatus, ContractError> {
+        // Issue #2100: resolve the borrower to its active loan ID.
+        let loan = helpers::get_active_loan_record(&env, &borrower)?;
+        covenant_monitoring::monitor_loan_covenants(&env, loan.id)
     }
 
     // ── Issue #2002: Quorum Slice Migration ───────────────────────────────────
@@ -5305,6 +5361,8 @@ impl QuorumCreditContract {
         attestor: Address,
     ) -> Option<attestor_specialization::AttestorSpecialization> {
         attestor_specialization::get_attestor_specialization(&env, &attestor)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Issue #1928: Quorum Slice Transparency Index Reporting
     // ─────────────────────────────────────────────────────────────────────────
@@ -5361,3 +5419,12 @@ impl QuorumCreditContract {
         audit_trail_compression::compress_audit_trail(&env, &credential_id, older_than_timestamp)
     }
 }
+
+// Issue #2008: property-based and invariant test files were never compiled, so
+// `cargo test` and the invariants CI workflow silently skipped them.
+#[cfg(test)]
+mod property_based_test;
+#[cfg(test)]
+mod property_based_invariants_test;
+#[cfg(test)]
+mod invariants_test;

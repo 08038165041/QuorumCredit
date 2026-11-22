@@ -136,6 +136,8 @@ mod cooldown_bypass_expiry_test;
 #[cfg(test)]
 mod slash_quorum_overflow_test;
 #[cfg(test)]
+mod duplicate_admin_signer_test;
+#[cfg(test)]
 mod slash_result_test;
 #[cfg(test)]
 mod slash_credit_score_failure_test;

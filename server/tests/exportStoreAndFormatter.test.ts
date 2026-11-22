@@ -37,6 +37,15 @@ describe("export formatting", () => {
   });
 });
 
+describe("csv formula injection", () => {
+  it("prefixes a formula-like holder so spreadsheets do not evaluate it (#2128)", () => {
+    const out = new ExportFormatter()
+      .format("cred-1", { ...data, holder: '=HYPERLINK("https://example.test")' }, "csv")
+      .toString("utf8");
+    expect(out).toContain(`"'=HYPERLINK(""https://example.test"")"`);
+  });
+});
+
 describe("export cleanup and scheduling", () => {
   it("drops expired completed exports when pending exports are read", () => {
     vi.useFakeTimers();

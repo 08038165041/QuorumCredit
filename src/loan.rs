@@ -14,7 +14,7 @@ use crate::types::{
     MAX_FORBEARANCE_PERIODS, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
     DEFAULT_REFERRAL_BONUS_BPS, MIN_VOUCH_AGE, SECS_PER_DAY,
 };
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Symbol, Vec};
 
 /// Vouch-age bonus constants
 const VOUCH_AGE_BONUS_MIN_SECS: u64 = 30 * 24 * 60 * 60;   // 30 days
@@ -119,7 +119,12 @@ fn vouch_yield_bps_uncached(env: &Env, vouch: &VouchRecord, borrower: &Address, 
         }
     }
     let unique_count = unique_borrowers.len() as i128;
-    let diversification_bonus = ((unique_count - 1) * 50).min(500);
+    // Issue #2069: an empty history contributes no bonus (previously -50).
+    let diversification_bonus = if unique_count == 0 {
+        0
+    } else {
+        ((unique_count - 1) * 50).min(500)
+    };
 
     (base_bps + age_bonus + rep_bonus + voucher_rep_bonus + reliability_bonus + diversification_bonus).max(0)
 }
@@ -142,6 +147,19 @@ pub fn calculate_dynamic_yield(env: &Env, borrower: &Address) -> i128 {
         .unwrap_or(0) as i128;
 
     (base_bps + (credit_score / 100) - (default_count * 50)).max(0)
+}
+
+/// Issue #2070: reputation/bps-weighted stake with checked arithmetic.
+///
+/// Computes `stake * weight / BPS_DENOMINATOR`, returning
+/// `ContractError::ArithmeticError` instead of panicking when the product
+/// overflows `i128`.
+pub(crate) fn weighted_stake(stake: i128, weight: i128) -> Result<i128, ContractError> {
+    stake
+        .checked_mul(weight)
+        .ok_or(ContractError::ArithmeticError)?
+        .checked_div(BPS_DENOMINATOR)
+        .ok_or(ContractError::ArithmeticError)
 }
 
 /// Request loan.
@@ -186,14 +204,13 @@ pub fn request_loan(
         .unwrap_or(Vec::new(&env));
 
     // Compute reputation-weighted total stake (Issue #866)
-    let total_stake: i128 = vouches
-        .iter()
-        .filter(|v| v.token == token_addr)
-        .map(|v| {
-            let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
-            v.stake * weight / BPS_DENOMINATOR
-        })
-        .sum();
+    let mut total_stake: i128 = 0;
+    for v in vouches.iter().filter(|v| v.token == token_addr) {
+        let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
+        total_stake = total_stake
+            .checked_add(weighted_stake(v.stake, weight)?)
+            .ok_or(ContractError::ArithmeticError)?;
+    }
 
     if total_stake < threshold {
         panic_with_error!(&env, ContractError::InsufficientFunds);
@@ -234,8 +251,8 @@ pub fn request_loan(
         // Apply tier rewards on top of per-vouch rate (Issue #866)
         let effective_rate = rate + (tier_adjusted_yield_bps - config(&env).yield_bps);
         let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
-        let weighted_stake = v.stake * weight / BPS_DENOMINATOR;
-        let vouch_yield = amount * weighted_stake / total_stake * effective_rate / 10_000;
+        let vouch_weighted = weighted_stake(v.stake, weight)?;
+        let vouch_yield = amount * vouch_weighted / total_stake * effective_rate / 10_000;
         total_yield += vouch_yield;
         yield_distribution.push_back(YieldDistributionEntry {
             voucher: v.voucher.clone(),
@@ -469,10 +486,12 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
         let outstanding_principal = (loan.amount - loan.amount_repaid).max(0);
         let new_interest =
             calculate_daily_compound_interest(outstanding_principal, days_elapsed);
+        // Issue #2068: surface overflow as ArithmeticError instead of silently
+        // saturating accrued interest to i128::MAX.
         loan.accrued_interest = loan
             .accrued_interest
             .checked_add(new_interest)
-            .unwrap_or(i128::MAX);
+            .ok_or(ContractError::ArithmeticError)?;
         // Advance the clock by whole days only; any sub-day remainder rolls
         // forward and will be picked up on the next call.
         loan.last_interest_calc += days_elapsed * SECS_PER_DAY;
@@ -616,7 +635,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             // Issue #1077: Add liquidity-tier yield bonus on top of the locked-in yield.
             // Illiquid tokens earn a higher bonus to compensate for risk.
             let tier_bonus_bps = crate::bridge::liquidity_tier_bonus_bps(&env, &loan.token_address);
-            let tier_yield_extra = v.stake * tier_bonus_bps / BPS_DENOMINATOR;
+            let tier_yield_extra = weighted_stake(v.stake, tier_bonus_bps)?;
 
             let payout = v.stake + vouch_yield + penalty_share + tier_yield_extra;
 
@@ -673,11 +692,24 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
             }
         }
 
-        // Try to mint excellent credit tier badge if eligible
-        let _ = crate::reputation::mint_excellent_badge(&env, &borrower);
+        // Try to mint excellent credit tier badge if eligible. Ineligibility is an
+        // expected outcome, so the repayment still succeeds; the failure is published
+        // so indexers can see why no badge was minted.
+        if let Err(err) = crate::reputation::mint_excellent_badge(&env, &borrower) {
+            env.events().publish(
+                (Symbol::new(&env, "reputation"), Symbol::new(&env, "mint_failed")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
-        // Update credit score after successful repayment
-        let _ = crate::credit_score::update_credit_score(env.clone(), borrower.clone());
+        // Update credit score after successful repayment. A failure must not undo the
+        // repayment, but it is published so a stale score is observable.
+        if let Err(err) = crate::credit_score::update_credit_score(env.clone(), borrower.clone()) {
+            env.events().publish(
+                (Symbol::new(&env, "credit"), Symbol::new(&env, "upd_fail")),
+                (borrower.clone(), err as u32),
+            );
+        }
 
         env.storage()
             .persistent()
@@ -845,7 +877,14 @@ pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
         // than only via the manual slash path. `NoActiveLoan` just means the
         // loan was already settled/closed; any other error is ignored so a
         // read never fails because of the lazy check.
-        let _ = crate::lazy_default_detection::check_and_mark_default(&env, loan.id);
+        if let Err(err) = crate::lazy_default_detection::check_and_mark_default(&env, loan.id) {
+            if err != ContractError::NoActiveLoan {
+                env.events().publish(
+                    (Symbol::new(&env, "lazy_default"), Symbol::new(&env, "check_failed")),
+                    (loan.id, err as u32),
+                );
+            }
+        }
         if let Ok(refreshed) = get_active_loan_record(&env, &borrower) {
             return Some(refreshed);
         }
@@ -867,7 +906,14 @@ pub fn loan_status_extended(env: Env, borrower: Address) -> LoanStatusEx {
 pub fn get_loan_by_id(env: Env, loan_id: u64) -> Option<LoanRecord> {
     // Issue #2005: run the lazy default check before returning so a
     // past-deadline unpaid loan is flagged as Defaulted on read.
-    let _ = crate::lazy_default_detection::check_and_mark_default(&env, loan_id);
+    if let Err(err) = crate::lazy_default_detection::check_and_mark_default(&env, loan_id) {
+        if err != ContractError::NoActiveLoan {
+            env.events().publish(
+                (Symbol::new(&env, "lazy_default"), Symbol::new(&env, "check_failed")),
+                (loan_id, err as u32),
+            );
+        }
+    }
     env.storage().persistent().get(&DataKey::Loan(loan_id))
 }
 
@@ -1191,14 +1237,13 @@ pub fn refinance_loan(
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(&env));
 
-    let total_stake: i128 = vouches
-        .iter()
-        .filter(|v| v.token == new_token)
-        .map(|v| {
-            let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
-            v.stake * weight / BPS_DENOMINATOR
-        })
-        .sum();
+    let mut total_stake: i128 = 0;
+    for v in vouches.iter().filter(|v| v.token == new_token) {
+        let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
+        total_stake = total_stake
+            .checked_add(weighted_stake(v.stake, weight)?)
+            .ok_or(ContractError::ArithmeticError)?;
+    }
 
     if total_stake < new_threshold {
         return Err(ContractError::InsufficientFunds);
@@ -1629,9 +1674,11 @@ pub fn approve_extension(
         soroban_sdk::Vec::new(&env);
     for v in vouches.iter() {
         let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
-        let weighted = v.stake * weight / crate::types::BPS_DENOMINATOR;
+        let weighted = weighted_stake(v.stake, weight)?;
         weighted_stakes.push_back((v.voucher.clone(), weighted));
-        total_stake = total_stake.saturating_add(weighted);
+        total_stake = total_stake
+            .checked_add(weighted)
+            .ok_or(ContractError::ArithmeticError)?;
     }
 
     // Single O(n) pass: accumulate approval_stake from the cached values.
@@ -1876,7 +1923,7 @@ pub fn buyback_loan(
         return Err(ContractError::VoucherNotFound);
     }
 
-    let cost = total_stake * loan.buyback_price / BPS_DENOMINATOR;
+    let cost = weighted_stake(total_stake, loan.buyback_price)?;
     if amount < cost {
         return Err(ContractError::InvalidAmount);
     }

@@ -151,10 +151,23 @@ fn bridge_token_inner(
     // Validate that source_token is an allowed token
     require_allowed_token(env, source_token)?;
 
-    // Pull `amount` of source_token from caller into this contract.
-    // The bridge_contract address is trusted to perform the cross-token conversion.
+    // Only admin-approved bridge contracts may be named as the conversion route.
+    if !is_approved_bridge(env, bridge_contract) {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    // Pull `amount` of source_token from caller into this contract, then confirm
+    // the contract's balance rose by exactly `amount`. A shortfall (e.g. a
+    // fee-on-transfer token) would otherwise leave the bridged balance credited
+    // beyond what the contract actually holds.
     let src_client = token::Client::new(env, source_token);
-    src_client.transfer(caller, &env.current_contract_address(), &amount);
+    let self_addr = env.current_contract_address();
+    let balance_before = src_client.balance(&self_addr);
+    src_client.transfer(caller, &self_addr, &amount);
+    let balance_after = src_client.balance(&self_addr);
+    if balance_after.checked_sub(balance_before) != Some(amount) {
+        return Err(ContractError::InvalidAmount);
+    }
 
     // Update the bridged-token balance tracker.
     let prev_balance: i128 = env
@@ -177,6 +190,40 @@ fn bridge_token_inner(
     );
 
     Ok(())
+}
+
+/// Admin: approve or revoke a bridge contract for use with `bridge_token`.
+///
+/// Only bridge contracts in the approved registry may be supplied to
+/// `bridge_token`; any other address is rejected.
+pub fn set_approved_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    bridge_contract: Address,
+    approved: bool,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+    require_admin_approval(&env, &admin_signers);
+
+    env.storage().persistent().set(
+        &DataKey::ApprovedBridgeContract(bridge_contract.clone()),
+        &approved,
+    );
+
+    env.events().publish(
+        (symbol_short!("bridge"), symbol_short!("approve")),
+        (bridge_contract, approved),
+    );
+
+    Ok(())
+}
+
+/// Returns `true` if `bridge_contract` is in the admin-approved registry.
+pub fn is_approved_bridge(env: &Env, bridge_contract: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ApprovedBridgeContract(bridge_contract.clone()))
+        .unwrap_or(false)
 }
 
 /// Query the bridged-token balance for a given token address.
@@ -217,13 +264,70 @@ pub fn set_bridge_token_price(
     Ok(())
 }
 
+/// Admin: withdraw `amount` of bridged `token_addr` held by this contract to
+/// `recipient`, decreasing the tracked bridged balance by the same amount.
+///
+/// Rule: bridged token balances are unencumbered reserves. They do not back
+/// individual loans (loan accounting is handled by `repay_with_swap` in the
+/// loan token), so the admin quorum may withdraw up to the tracked balance and
+/// no more.
+///
+/// # Errors
+///
+/// - `ContractPaused`    — contract is paused.
+/// - `InvalidAmount`     — `amount ≤ 0`.
+/// - `InsufficientFunds` — `amount` exceeds the tracked bridged balance.
+pub fn withdraw_bridged_token(
+    env: Env,
+    admin_signers: Vec<Address>,
+    token_addr: Address,
+    recipient: Address,
+    amount: i128,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+    require_admin_approval(&env, &admin_signers);
+
+    if amount <= 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let balance = get_bridged_token_balance(env.clone(), token_addr.clone());
+    if amount > balance {
+        return Err(ContractError::InsufficientFunds);
+    }
+    let new_balance = balance
+        .checked_sub(amount)
+        .ok_or(ContractError::ArithmeticError)?;
+
+    // Update the tracker before the external transfer.
+    env.storage()
+        .persistent()
+        .set(&DataKey::BridgedTokenBalance(token_addr.clone()), &new_balance);
+
+    token::Client::new(&env, &token_addr).transfer(
+        &env.current_contract_address(),
+        &recipient,
+        &amount,
+    );
+
+    env.events().publish(
+        (symbol_short!("bridge"), symbol_short!("withdraw")),
+        (token_addr, recipient, amount),
+    );
+
+    Ok(())
+}
+
 /// Query the oracle price (in basis points) for a bridge token.
-/// Returns `10_000` (1:1 parity) if no price has been set.
-pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> i128 {
+///
+/// Returns `ContractError::InvalidToken` if no price has been configured. There
+/// is deliberately no parity fallback: a token without an explicit price must
+/// never be convertible at face value.
+pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> Result<i128, ContractError> {
     env.storage()
         .persistent()
         .get(&DataKey::BridgeTokenPrice(token_addr.clone()))
-        .unwrap_or(10_000i128)
+        .ok_or(ContractError::InvalidToken)
 }
 
 // ── Issue #1076: Token swap on repayment mismatch ─────────────────────────────
@@ -250,7 +354,11 @@ pub fn get_bridge_token_price(env: &Env, token_addr: &Address) -> i128 {
 /// # Errors
 ///
 /// - `NoActiveLoan`       — borrower has no active or defaulted loan.
-/// - `InvalidAmount`      — `payment_amount ≤ 0` or would exceed outstanding balance.
+/// - `InvalidAmount`      — `payment_amount ≤ 0`.
+///
+/// Overpayments are not an error: only the amount needed to clear the
+/// outstanding balance is transferred from the borrower, so the excess stays
+/// with the borrower.
 /// - `InvalidToken`       — `payment_token` is not an allowed token.
 /// - `InsufficientFunds`  — converted amount is zero (price oracle returned bad data).
 /// - `ContractPaused`     — contract is paused.
@@ -333,8 +441,8 @@ fn repay_with_swap_inner(
     // ── Price conversion: payment_token → loan_token ─────────────────────────
     // Oracle prices are stored in basis points relative to a common denominator.
     // converted = payment_amount * payment_token_price / loan_token_price
-    let payment_token_price = get_bridge_token_price(env, payment_token);
-    let loan_token_price = get_bridge_token_price(env, &loan_token);
+    let payment_token_price = get_bridge_token_price(env, payment_token)?;
+    let loan_token_price = get_bridge_token_price(env, &loan_token)?;
 
     if loan_token_price == 0 {
         return Err(ContractError::InsufficientFunds);
@@ -360,22 +468,43 @@ fn repay_with_swap_inner(
         .unwrap_or(0)
         .max(0);
 
-    // Cap converted_amount to outstanding (no overpayment)
-    let effective_payment = converted_amount.min(outstanding);
+    // ── Pull only what the loan needs, so overpayments are never taken ────────
+    // Amount of payment_token needed to clear `outstanding` in loan_token terms,
+    // rounded up so the borrower never pays less than the balance owed.
+    let needed_payment = outstanding
+        .checked_mul(loan_token_price)
+        .ok_or(ContractError::ArithmeticError)?
+        .checked_add(payment_token_price - 1)
+        .ok_or(ContractError::ArithmeticError)?
+        / payment_token_price;
+    let pull_amount = payment_amount.min(needed_payment);
 
-    // ── Pull payment_token from borrower into contract ────────────────────────
-    let src_client = token::Client::new(env, payment_token);
-    src_client.transfer(borrower, &env.current_contract_address(), &payment_amount);
+    if pull_amount <= 0 {
+        return Err(ContractError::InsufficientFunds);
+    }
 
-    // Update bridged token balance
+    let effective_payment = pull_amount
+        .checked_mul(payment_token_price)
+        .ok_or(ContractError::ArithmeticError)?
+        / loan_token_price;
+    // Cap to outstanding (rounding can only push this at most one unit over)
+    let effective_payment = effective_payment.min(outstanding);
+
+    // Compute the new bridged balance before moving any tokens, so an overflow
+    // aborts the call instead of leaving tokens held but unaccounted for.
     let prev_bal: i128 = env
         .storage()
         .persistent()
         .get(&DataKey::BridgedTokenBalance(payment_token.clone()))
         .unwrap_or(0i128);
     let new_bal = prev_bal
-        .checked_add(payment_amount)
-        .unwrap_or(prev_bal);
+        .checked_add(pull_amount)
+        .ok_or(ContractError::ArithmeticError)?;
+
+    // ── Pull payment_token from borrower into contract ────────────────────────
+    let src_client = token::Client::new(env, payment_token);
+    src_client.transfer(borrower, &env.current_contract_address(), &pull_amount);
+
     env.storage()
         .persistent()
         .set(&DataKey::BridgedTokenBalance(payment_token.clone()), &new_bal);
@@ -385,7 +514,7 @@ fn repay_with_swap_inner(
         (
             borrower.clone(),
             payment_token.clone(),
-            payment_amount,
+            pull_amount,
             loan_token.clone(),
             effective_payment,
         ),
@@ -624,14 +753,26 @@ mod tests {
     // ── #1075: Bridge token price ─────────────────────────────────────────────
 
     #[test]
-    fn test_get_bridge_token_price_default_is_parity() {
+    fn test_get_bridge_token_price_missing_is_error() {
         let (env, contract_id) = make_env();
         let token_addr = Address::generate(&env);
-        // Default price is 10_000 bps (1:1)
+        // No price configured → error, never a 1:1 parity fallback
         let price = env.as_contract(&contract_id, || {
             get_bridge_token_price(&env, &token_addr)
         });
-        assert_eq!(price, 10_000);
+        assert_eq!(price, Err(ContractError::InvalidToken));
+    }
+
+    #[test]
+    fn test_get_bridge_token_price_returns_configured_value() {
+        let (env, contract_id) = make_env();
+        let token_addr = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::BridgeTokenPrice(token_addr.clone()), &5_000i128);
+            assert_eq!(get_bridge_token_price(&env, &token_addr), Ok(5_000));
+        });
     }
 
     #[test]
@@ -642,6 +783,121 @@ mod tests {
             get_bridged_token_balance(env.clone(), token_addr)
         });
         assert_eq!(balance, 0i128);
+    }
+
+    // ── #2108: bridged balance withdrawal ─────────────────────────────────────
+
+    #[test]
+    fn test_bridge_then_withdraw_reconciles_balance() {
+        let (env, contract_id) = make_env();
+        let (token_addr, admins) = env.as_contract(&contract_id, || {
+            let cfg = config(&env);
+            (cfg.token, cfg.admins)
+        });
+        let caller = Address::generate(&env);
+        let bridge_contract = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_addr).mint(&caller, &1_000);
+
+        env.as_contract(&contract_id, || {
+            bridge_token(
+                env.clone(),
+                caller.clone(),
+                bridge_contract.clone(),
+                token_addr.clone(),
+                1_000,
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            env.as_contract(&contract_id, || {
+                get_bridged_token_balance(env.clone(), token_addr.clone())
+            }),
+            1_000
+        );
+
+        env.as_contract(&contract_id, || {
+            withdraw_bridged_token(
+                env.clone(),
+                admins.clone(),
+                token_addr.clone(),
+                recipient.clone(),
+                400,
+            )
+            .unwrap();
+        });
+
+        let final_balance = env.as_contract(&contract_id, || {
+            get_bridged_token_balance(env.clone(), token_addr.clone())
+        });
+        assert_eq!(final_balance, 600);
+        assert_eq!(token::Client::new(&env, &token_addr).balance(&recipient), 400);
+    }
+
+    #[test]
+    fn test_withdraw_bridged_token_rejects_amount_above_balance() {
+        let (env, contract_id) = make_env();
+        let (token_addr, admins) = env.as_contract(&contract_id, || {
+            let cfg = config(&env);
+            (cfg.token, cfg.admins)
+        });
+        let recipient = Address::generate(&env);
+        let result = env.as_contract(&contract_id, || {
+            withdraw_bridged_token(
+                env.clone(),
+                admins.clone(),
+                token_addr.clone(),
+                recipient.clone(),
+                1,
+            )
+        });
+        assert_eq!(result, Err(ContractError::InsufficientFunds));
+    }
+
+    // ── #2055: bridge registry and delivery checks ────────────────────────────
+
+    #[test]
+    fn test_bridge_token_rejects_unapproved_bridge_contract() {
+        let (env, contract_id) = make_env();
+        let caller = Address::generate(&env);
+        let rogue_bridge = Address::generate(&env);
+        let token_addr = env.as_contract(&contract_id, || config(&env).token);
+
+        let result = env.as_contract(&contract_id, || {
+            bridge_token_inner(&env, &caller, &rogue_bridge, &token_addr, 100)
+        });
+        assert_eq!(result, Err(ContractError::UnauthorizedCaller));
+
+        // No credit must be recorded for a rejected bridge.
+        let balance = env.as_contract(&contract_id, || {
+            get_bridged_token_balance(env.clone(), token_addr.clone())
+        });
+        assert_eq!(balance, 0);
+    }
+
+    #[test]
+    fn test_bridge_token_accepts_approved_bridge_and_credits_balance() {
+        let (env, contract_id) = make_env();
+        let caller = Address::generate(&env);
+        let bridge = Address::generate(&env);
+        let token_addr = env.as_contract(&contract_id, || config(&env).token);
+        let admins = env.as_contract(&contract_id, || config(&env).admins);
+        StellarAssetClient::new(&env, &token_addr).mint(&caller, &1_000);
+
+        let approve = env.as_contract(&contract_id, || {
+            set_approved_bridge(env.clone(), admins.clone(), bridge.clone(), true)
+        });
+        assert_eq!(approve, Ok(()));
+
+        let result = env.as_contract(&contract_id, || {
+            bridge_token_inner(&env, &caller, &bridge, &token_addr, 400)
+        });
+        assert_eq!(result, Ok(()));
+
+        let balance = env.as_contract(&contract_id, || {
+            get_bridged_token_balance(env.clone(), token_addr.clone())
+        });
+        assert_eq!(balance, 400);
     }
 
     // ── #1454/#1455: `repay_cross_chain_atomic` replay + reentrancy ──────────

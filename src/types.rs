@@ -450,6 +450,7 @@ pub enum DataKey {
     SlashVoteQuorum, // u32 quorum in basis points (e.g. 5000 = 50%)
     ReferredBy(Address), // borrower → Address of referrer
     ReferralBonusBps, // u32 referral bonus in basis points (default 100 = 1%)
+    RecurringPaymentKeeper, // Address of the keeper allowed to record recurring-payment failures (instance)
     MaxVouchersPerBorrower, // u32 maximum number of vouchers per borrower (default 50)
     BorrowerCollateral(Address), // borrower → i128 collateral amount deposited
     BorrowerCollateralToken(Address), // borrower → Address token used for collateral
@@ -839,6 +840,8 @@ pub enum DataKey {
     BridgedTokenBalance(Address),
     /// token_addr → u32 price in basis points relative to native token
     BridgeTokenPrice(Address),
+    /// bridge_contract → bool: admin-approved bridge contract (issue #2055)
+    ApprovedBridgeContract(Address),
     /// Reentrancy guard for token transfer operations
     ReentrancyGuard,
     // ── Issue #1070: Circuit Breaker for Rapid Default Cascade ─────────────────
@@ -892,6 +895,9 @@ pub enum DataKey {
     FlashLoanPerContractCap(Address),
     /// Recent flash loan activity records (bounded ring buffer)
     FlashLoanHistory,
+    /// period index (timestamp / FLASH_LOAN_ARCHIVE_PERIOD_SECS) → Vec<FlashLoanRecord>:
+    /// flash loan records evicted from FlashLoanHistory, bucketed by period
+    FlashLoanArchive(u64),
     /// contract → u64: ledger timestamp of that contract's last flash loan
     FlashLoanLastTimestamp(Address),
     /// contract → bool: whether this callback contract is allowed to receive flash loans
@@ -940,6 +946,7 @@ pub enum DataKey {
     ReferralCodeOwner(BytesN<32>),
     /// referrer → u32: number of successful referrals
     ReferralCount(Address),
+    PendingReferralReward(Address), // referrer → i128 reward owed but not yet paid (reserve was short)
 
     // ── Reputation badges (NFT-style achievements) ───────────────────────────
     /// (owner, badge_type) → Badge
@@ -3191,7 +3198,17 @@ pub struct CooldownBypassRequest {
     pub requested_at: u64,
     pub approvers: Vec<Address>,
     pub approved: bool,
+    /// Ledger timestamp after which the bypass can no longer be voted on or used.
+    /// Set to `requested_at + COOLDOWN_BYPASS_VALIDITY_SECS` on request and
+    /// reset to `approved_at + COOLDOWN_BYPASS_VALIDITY_SECS` when approval is reached.
+    pub expires_at: u64,
 }
+
+/// Validity window for an approved cooldown bypass (issue #2104).
+pub const COOLDOWN_BYPASS_VALIDITY_SECS: u64 = 24 * 60 * 60;
+
+/// Maximum byte length accepted for the free-text `reason` on a cooldown bypass request (issue #2104).
+pub const MAX_COOLDOWN_BYPASS_REASON_LEN: u32 = 256;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3567,10 +3584,17 @@ pub enum LoanMilestone {
 }
 
 impl LoanMilestone {
-    /// Fraction of a voucher's stake released when this milestone is reached,
-    /// expressed in basis points. Each milestone releases 25% (2_500 bps).
+    /// Fraction of a voucher's original stake released when this milestone is
+    /// reached, in basis points. Issue #2118: the schedule sums to 10_000 bps
+    /// (100%) across all milestones. `Issued` is a disbursement event, not a
+    /// repayment, so it releases nothing.
     pub fn release_bps(&self) -> u32 {
-        2_500
+        match self {
+            LoanMilestone::Issued => 0,
+            LoanMilestone::FirstPaymentMade => 2_500,
+            LoanMilestone::HalfRepaid => 2_500,
+            LoanMilestone::Completed => 5_000,
+        }
     }
 
     /// Stable numeric discriminant used as a storage-key component.
@@ -3697,6 +3721,9 @@ pub struct GovParticipationMetrics {
 pub const GOV_PROPOSAL_THRESHOLD_BPS: i128 = 100;
 /// BPS denominator for GOV calculations.
 pub const GOV_BPS_DENOMINATOR: i128 = 10_000;
+
+/// Basis-point denominator (100% = 10_000 bps) used by fee, rate and utilization math.
+pub const BPS_DENOMINATOR: i128 = 10_000;
 /// Default DAO voting period in seconds (7 days).
 pub const DAO_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 /// Default DAO timelock after voting before execution, in seconds (2 days).

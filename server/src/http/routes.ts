@@ -5,7 +5,7 @@ import { issueToken } from "../auth/tokens.js";
 import { loadApiKeyStore, type ApiKeyStore } from "../auth/apiKeyStore.js";
 import { defaultAuthRateLimiter, type AuthRateLimiter } from "../auth/rateLimiter.js";
 import { metrics } from "./metricsRegistry.js";
-import { expenseStore, isExpenseCategory } from "../expenses/expenseStore.js";
+import { expenseStore, isExpenseCategory, isValidExpenseAmount } from "../expenses/expenseStore.js";
 import { loanCartStore } from "../cart/loanCartStore.js";
 import { batchVerificationStore } from "../batch/batchVerificationStore.js";
 import { auditReportGenerator, type ReportFormat } from "../batch/auditReportGenerator.js";
@@ -38,6 +38,10 @@ import { regionAwareRouter } from "./crossRegionReplication.js";
 import { responseTransformer } from "./responseTransformer.js";
 // Issue #1753 — Credential Archival Service
 import { buildCredentialArchivalService } from "../credentials/credentialArchival.js";
+import { parseBoundedInt } from "./queryParams.js";
+import { applyDeprecationHeaders, deprecationRegistry } from "./deprecation.js";
+import { tokenExpirationMonitor } from "../auth/tokenExpirationMonitor.js";
+import { analyticsService } from "../credentials/analyticsService.js";
 
 export interface RouteContext {
   authSecret: string;
@@ -249,9 +253,9 @@ export function handleHttpRequest(
             res.end(JSON.stringify({ error: "category must be one of business, education, healthcare, other" }));
             return;
           }
-          if (typeof body.amount !== "number" || !Number.isFinite(body.amount) || body.amount <= 0) {
+          if (!isValidExpenseAmount(body.amount)) {
             res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: "amount must be a positive number" }));
+            res.end(JSON.stringify({ error: "amount must be a positive integer number of minor units (cents)" }));
             return;
           }
           const category = body.category;
@@ -644,7 +648,7 @@ export function handleHttpRequest(
       res.end(JSON.stringify({ error: "borrowerId query param required" }));
       return;
     }
-    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, 200, 50);
     const batches = batchVerificationStore.getBorrowerbatches(borrowerId, limit);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ borrowerId, batches }));
@@ -767,7 +771,7 @@ export function handleHttpRequest(
   }
 
   if (url.pathname === "/audit-report/history" && req.method === "GET") {
-    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, 200, 50);
     const history = auditReportGenerator.getReportHistory(limit);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ reports: history }));
@@ -1469,7 +1473,7 @@ export function handleHttpRequest(
   );
   if (analyticsTrendsMatch && req.method === "GET") {
     const holderId = decodeURIComponent(analyticsTrendsMatch[1] as string);
-    const days = parseInt(url.searchParams.get("days") || "30");
+    const days = parseBoundedInt(url.searchParams.get("days"), 1, 365, 30);
 
     const trends = analyticsService.getTrendData(holderId, days);
 
@@ -1643,7 +1647,7 @@ export function handleHttpRequest(
 
   // GET /auth/tokens/warnings/recent - Get recent expiration warnings
   if (req.method === "GET" && url.pathname === "/auth/tokens/warnings/recent") {
-    const limit = parseInt(url.searchParams.get("limit") || "20");
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, 200, 20);
     const warnings = tokenExpirationMonitor.getRecentWarnings(limit);
 
     metrics.incCounter("qc_token_warnings_retrieved_total");
@@ -1779,9 +1783,7 @@ export function handleHttpRequest(
   const notifHistMatch = url.pathname.match(/^\/notifications\/history\/([^/]+)$/);
   if (notifHistMatch && req.method === "GET") {
     const credentialId = decodeURIComponent(notifHistMatch[1] as string);
-    const limit = url.searchParams.get("limit")
-      ? parseInt(url.searchParams.get("limit") as string, 10)
-      : 50;
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, 200, 50);
     const history = notificationStore.getNotificationHistory(credentialId, limit);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(history));
@@ -1832,9 +1834,7 @@ export function handleHttpRequest(
   // GET /exports/:credentialId — Get exports for credential
   if (exportCreateMatch && req.method === "GET") {
     const credentialId = decodeURIComponent(exportCreateMatch[1] as string);
-    const limit = url.searchParams.get("limit")
-      ? parseInt(url.searchParams.get("limit") as string, 10)
-      : 50;
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, 200, 50);
     const exports = exportStore.getCredentialExports(credentialId, limit);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(exports));

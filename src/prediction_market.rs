@@ -19,7 +19,7 @@
 use soroban_sdk::{contracttype, symbol_short, token, Address, Env, String, Vec};
 
 use crate::errors::ContractError;
-use crate::helpers::{require_admin_approval, require_not_paused};
+use crate::helpers::{require_admin_approval, require_allowed_token, require_not_paused};
 use crate::types::DataKey;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -75,6 +75,8 @@ pub struct PredictionMarket {
     pub outcome: Option<bool>,
     /// Market lifecycle status.
     pub status: MarketStatus,
+    /// Token used for every stake and payout in this market. Fixed at creation.
+    pub token: Address,
 }
 
 /// A single participant's position in a market.
@@ -122,9 +124,11 @@ pub struct PredictionAccuracy {
 /// - `rate_threshold_bps`  — the interest rate threshold being predicted (bps).
 /// - `closes_at`           — ledger timestamp when prediction window closes.
 /// - `resolves_at`         — ledger timestamp by which the oracle will resolve.
+/// - `token_addr`          — token for all stakes and payouts; must be allowed.
 ///
 /// # Errors
 /// - `InvalidAmount`        — `closes_at` or `resolves_at` is in the past.
+/// - `InvalidToken`         — `token_addr` is not an allowed protocol token.
 /// - `ContractPaused`       — contract is paused.
 pub fn create_market(
     env: &Env,
@@ -133,9 +137,11 @@ pub fn create_market(
     rate_threshold_bps: u32,
     closes_at: u64,
     resolves_at: u64,
+    token_addr: Address,
 ) -> Result<u64, ContractError> {
     require_not_paused(env)?;
     require_admin_approval(env, &admin_signers);
+    require_allowed_token(env, &token_addr)?;
 
     let now = env.ledger().timestamp();
     if closes_at <= now || resolves_at <= closes_at {
@@ -162,6 +168,7 @@ pub fn create_market(
         total_no_stake: 0,
         outcome: None,
         status: MarketStatus::Open,
+        token: token_addr,
     };
 
     env.storage()
@@ -185,8 +192,7 @@ pub fn create_market(
 /// - `participant` — address placing the bet; must sign.
 /// - `market_id`   — target market.
 /// - `side`        — YES or NO.
-/// - `stake`       — amount in stroops (must be > 0).
-/// - `token_addr`  — protocol token address.
+/// - `stake`       — amount in stroops (must be > 0). Paid in the market's token.
 ///
 /// # Errors
 /// - `ProposalNotFound`     — unknown market ID.
@@ -200,7 +206,6 @@ pub fn place_prediction(
     market_id: u64,
     side: PredictionSide,
     stake: i128,
-    token_addr: Address,
 ) -> Result<(), ContractError> {
     require_not_paused(env)?;
     participant.require_auth();
@@ -219,12 +224,11 @@ pub fn place_prediction(
         return Err(ContractError::VotingPeriodEnded);
     }
 
+    // Past the close time the call is refused without writing anything. Soroban
+    // rolls back all storage writes made by a failing call, so a status change
+    // made here would never persist. Use `close_market` to record the transition.
     let now = env.ledger().timestamp();
     if now >= market.closes_at {
-        market.status = MarketStatus::PendingResolution;
-        env.storage()
-            .persistent()
-            .set(&DataKey::PredictionMarket(market_id), &market);
         return Err(ContractError::VotingPeriodEnded);
     }
 
@@ -233,8 +237,8 @@ pub fn place_prediction(
         return Err(ContractError::AlreadyVoted);
     }
 
-    // Transfer stake from participant to contract.
-    let tc = token::Client::new(env, &token_addr);
+    // Transfer stake from participant to contract, in the market's token.
+    let tc = token::Client::new(env, &market.token);
     tc.transfer(&participant, &env.current_contract_address(), &stake);
 
     // Record position.
@@ -273,7 +277,8 @@ pub fn place_prediction(
 ///
 /// # Errors
 /// - `ProposalNotFound`        — unknown market ID.
-/// - `InvalidStateTransition`  — market is not in `PendingResolution` or `Open`.
+/// - `InvalidStateTransition`  — market is not in `PendingResolution` or `Open`,
+///   or the prediction window has not closed yet (`now < closes_at`).
 /// - `ContractPaused`          — contract is paused.
 pub fn resolve_market(
     env: &Env,
@@ -294,6 +299,13 @@ pub fn resolve_market(
         return Err(ContractError::InvalidStateTransition);
     }
 
+    // A market cannot be resolved while its prediction window is still open.
+    // `resolves_at` is the oracle's target deadline, not a gate: resolution is
+    // permitted from `closes_at` onward, including before `resolves_at`.
+    if env.ledger().timestamp() < market.closes_at {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
     market.outcome = Some(outcome);
     market.status = MarketStatus::Resolved;
     env.storage()
@@ -304,6 +316,46 @@ pub fn resolve_market(
         (symbol_short!("market"), symbol_short!("resolve")),
         (market_id, outcome),
     );
+
+    Ok(())
+}
+
+/// Move an open market whose prediction window has closed to `PendingResolution`.
+///
+/// Anyone may call this once `closes_at` has passed. It is a separate
+/// entrypoint because `place_prediction` must return an error after close, and
+/// that error rolls back any status write made in the same call.
+///
+/// # Errors
+/// - `ProposalNotFound`       — unknown market ID.
+/// - `InvalidStateTransition` — market is not open, or the window is still open.
+/// - `ContractPaused`         — contract is paused.
+pub fn close_market(env: &Env, market_id: u64) -> Result<(), ContractError> {
+    require_not_paused(env)?;
+
+    let mut market: PredictionMarket = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PredictionMarket(market_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if market.status == MarketStatus::PendingResolution {
+        return Ok(());
+    }
+    if market.status != MarketStatus::Open {
+        return Err(ContractError::InvalidStateTransition);
+    }
+    if env.ledger().timestamp() < market.closes_at {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    market.status = MarketStatus::PendingResolution;
+    env.storage()
+        .persistent()
+        .set(&DataKey::PredictionMarket(market_id), &market);
+
+    env.events()
+        .publish((symbol_short!("market"), symbol_short!("closed")), market_id);
 
     Ok(())
 }
@@ -350,8 +402,7 @@ pub fn cancel_market(
 ///
 /// # Parameters
 /// - `participant`  — winner claiming payout; must sign.
-/// - `market_id`    — market ID.
-/// - `token_addr`   — protocol token address.
+/// - `market_id`    — market ID. Payout is paid in the market's token.
 ///
 /// # Errors
 /// - `ProposalNotFound`       — unknown market ID.
@@ -362,7 +413,6 @@ pub fn claim_payout(
     env: &Env,
     participant: Address,
     market_id: u64,
-    token_addr: Address,
 ) -> Result<i128, ContractError> {
     participant.require_auth();
 
@@ -410,17 +460,29 @@ pub fn claim_payout(
             Some(true) => market.total_yes_stake,
             _ => market.total_no_stake,
         };
-        let total_pot = market.total_yes_stake + market.total_no_stake;
+        let total_pot = market
+            .total_yes_stake
+            .checked_add(market.total_no_stake)
+            .ok_or(ContractError::ArithmeticError)?;
 
         if winning_stake == 0 {
             0
         } else {
-            let gross = position.stake * total_pot / winning_stake;
-            let fee = gross * PREDICTION_MARKET_FEE_BPS as i128 / 10_000;
-            let net = gross - fee;
+            // Checked arithmetic: with `overflow-checks = true` a plain `*`
+            // would panic and abort the transaction on a large pot.
+            let gross = position
+                .stake
+                .checked_mul(total_pot)
+                .and_then(|v| v.checked_div(winning_stake))
+                .ok_or(ContractError::ArithmeticError)?;
+            let fee = gross
+                .checked_mul(PREDICTION_MARKET_FEE_BPS as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or(ContractError::ArithmeticError)?;
+            let net = gross.checked_sub(fee).ok_or(ContractError::ArithmeticError)?;
 
             // Accumulate fee to treasury.
-            crate::community_treasury::deposit_to_treasury(env, fee);
+            crate::community_treasury::deposit_to_treasury(env, fee)?;
 
             net
         }
@@ -430,9 +492,9 @@ pub fn claim_payout(
     position.claimed = true;
     env.storage().persistent().set(&pos_key, &position);
 
-    // Transfer payout.
+    // Transfer payout in the market's token.
     if payout > 0 {
-        let tc = token::Client::new(env, &token_addr);
+        let tc = token::Client::new(env, &market.token);
         tc.transfer(&env.current_contract_address(), &participant, &payout);
     }
 
@@ -518,6 +580,131 @@ mod tests {
         (env, contract_id)
     }
 
+    /// Like `setup()`, but also returns the registered admin address so tests
+    /// can call admin-gated entrypoints such as `resolve_market`.
+    fn setup_with_admin() -> (Env, Address, Vec<Address>) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let admins = Vec::from_array(&env, [admin.clone()]);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, crate::QuorumCreditContract);
+        let client = crate::QuorumCreditContractClient::new(&env, &contract_id);
+        client.initialize(&deployer, &admins, &1, &token_id.address());
+        (env, contract_id, admins)
+    }
+
+    /// Seed an `Open` market with the given close/resolve times.
+    fn seed_open_market(env: &Env, contract_id: &Address, closes_at: u64, resolves_at: u64) {
+        let market = PredictionMarket {
+            id: 1,
+            description: make_description(env),
+            rate_threshold_bps: 300,
+            closes_at,
+            resolves_at,
+            total_yes_stake: 0,
+            total_no_stake: 0,
+            outcome: None,
+            status: MarketStatus::Open,
+        };
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(1), &market);
+        });
+    }
+
+    #[test]
+    fn test_claim_payout_overflow_returns_arithmetic_error() {
+        let (env, contract_id) = setup();
+        let market_id = 1u64;
+        let now = env.ledger().timestamp();
+        let huge = i128::MAX / 2;
+        let market = PredictionMarket {
+            id: market_id,
+            description: make_description(&env),
+            rate_threshold_bps: 300,
+            closes_at: now + 3600,
+            resolves_at: now + 7200,
+            total_yes_stake: huge,
+            total_no_stake: 0,
+            outcome: Some(true),
+            status: MarketStatus::Resolved,
+        };
+        let participant = Address::generate(&env);
+        let token = Address::generate(&env);
+        let position = MarketPosition {
+            participant: participant.clone(),
+            side: PredictionSide::Yes,
+            stake: huge,
+            claimed: false,
+        };
+
+        // stake * total_pot overflows i128; must surface as ArithmeticError,
+        // not a panic that aborts the transaction.
+        let result = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(market_id), &market);
+            env.storage().persistent().set(
+                &DataKey::MarketPosition(market_id, participant.clone()),
+                &position,
+            );
+            claim_payout(&env, participant.clone(), market_id, token)
+        });
+        assert_eq!(result, Err(ContractError::ArithmeticError));
+    }
+
+    #[test]
+    fn test_resolve_market_rejected_before_close() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        seed_open_market(&env, &contract_id, now + 3600, now + 7200);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, true)
+        });
+        assert_eq!(result, Err(ContractError::InvalidStateTransition));
+
+        // Market must remain unresolved after the rejected attempt.
+        let market = env.as_contract(&contract_id, || get_market(&env, 1)).unwrap();
+        assert_eq!(market.status, MarketStatus::Open);
+        assert_eq!(market.outcome, None);
+    }
+
+    #[test]
+    fn test_resolve_market_allowed_at_close_boundary() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        let closes_at = now + 3600;
+        seed_open_market(&env, &contract_id, closes_at, closes_at + 3600);
+        env.ledger().set_timestamp(closes_at);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, false)
+        });
+        assert_eq!(result, Ok(()));
+        let market = env.as_contract(&contract_id, || get_market(&env, 1)).unwrap();
+        assert_eq!(market.status, MarketStatus::Resolved);
+        assert_eq!(market.outcome, Some(false));
+    }
+
+    #[test]
+    fn test_resolve_market_allowed_after_resolves_at() {
+        let (env, contract_id, admins) = setup_with_admin();
+        let now = env.ledger().timestamp();
+        let closes_at = now + 3600;
+        let resolves_at = now + 7200;
+        seed_open_market(&env, &contract_id, closes_at, resolves_at);
+        env.ledger().set_timestamp(resolves_at + 1);
+
+        let result = env.as_contract(&contract_id, || {
+            resolve_market(&env, admins.clone(), 1, true)
+        });
+        assert_eq!(result, Ok(()));
+    }
+
     fn make_description(env: &Env) -> String {
         String::from_str(env, "yield_bps > 300 in 6 months")
     }
@@ -571,17 +758,58 @@ mod tests {
             total_no_stake: 0,
             outcome: None,
             status: MarketStatus::Open,
+            token: Address::generate(&env),
         };
 
         let participant = Address::generate(&env);
-        let token = Address::generate(&env);
         let result = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
                 .set(&DataKey::PredictionMarket(market_id), &market);
-            place_prediction(&env, participant, market_id, PredictionSide::Yes, 0, token)
+            place_prediction(&env, participant, market_id, PredictionSide::Yes, 0)
         });
         assert_eq!(result, Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_close_market_persists_transition_after_refused_prediction() {
+        let (env, contract_id) = setup();
+        let market_id = 1u64;
+        let now = env.ledger().timestamp();
+        let market = PredictionMarket {
+            id: market_id,
+            description: make_description(&env),
+            rate_threshold_bps: 300,
+            closes_at: now + 3600,
+            resolves_at: now + 7200,
+            total_yes_stake: 0,
+            total_no_stake: 0,
+            outcome: None,
+            status: MarketStatus::Open,
+            token: Address::generate(&env),
+        };
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PredictionMarket(market_id), &market);
+        });
+
+        // Advance past closes_at, then try to predict. The call is refused.
+        env.ledger().set_timestamp(now + 3601);
+        let participant = Address::generate(&env);
+        let result = env.as_contract(&contract_id, || {
+            place_prediction(&env, participant, market_id, PredictionSide::Yes, 1000)
+        });
+        assert_eq!(result, Err(ContractError::VotingPeriodEnded));
+
+        // The refused call wrote nothing, so the market is still Open.
+        let status = env.as_contract(&contract_id, || get_market(&env, market_id).unwrap().status);
+        assert_eq!(status, MarketStatus::Open);
+
+        // close_market records the transition, and it is visible through get_market.
+        env.as_contract(&contract_id, || close_market(&env, market_id).unwrap());
+        let status = env.as_contract(&contract_id, || get_market(&env, market_id).unwrap().status);
+        assert_eq!(status, MarketStatus::PendingResolution);
     }
 
     #[test]
@@ -599,16 +827,85 @@ mod tests {
             total_no_stake: 0,
             outcome: Some(true),
             status: MarketStatus::Resolved,
+            token: Address::generate(&env),
         };
 
         let participant = Address::generate(&env);
-        let token = Address::generate(&env);
         let result = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
                 .set(&DataKey::PredictionMarket(market_id), &market);
-            place_prediction(&env, participant, market_id, PredictionSide::Yes, 1000, token)
+            place_prediction(&env, participant, market_id, PredictionSide::Yes, 1000)
         });
         assert_eq!(result, Err(ContractError::VotingPeriodEnded));
+    }
+
+    fn setup_with_admin() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let admins = Vec::from_array(&env, [admin.clone()]);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, crate::QuorumCreditContract);
+        let client = crate::QuorumCreditContractClient::new(&env, &contract_id);
+        client.initialize(&deployer, &admins, &1, &token_id.address());
+        (env, contract_id, admin, token_id.address())
+    }
+
+    #[test]
+    fn test_create_market_rejects_token_not_on_allowlist() {
+        let (env, contract_id, admin, _token) = setup_with_admin();
+        let signers = Vec::from_array(&env, [admin]);
+        let rogue = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        let result = env.as_contract(&contract_id, || {
+            create_market(
+                &env,
+                signers.clone(),
+                make_description(&env),
+                300,
+                now + 3600,
+                now + 7200,
+                rogue.clone(),
+            )
+        });
+        assert_eq!(result, Err(ContractError::InvalidToken));
+    }
+
+    #[test]
+    fn test_market_token_is_fixed_at_creation_and_used_for_stakes() {
+        let (env, contract_id, admin, token) = setup_with_admin();
+        let signers = Vec::from_array(&env, [admin]);
+        let now = env.ledger().timestamp();
+        let market_id = env
+            .as_contract(&contract_id, || {
+                create_market(
+                    &env,
+                    signers.clone(),
+                    make_description(&env),
+                    300,
+                    now + 3600,
+                    now + 7200,
+                    token.clone(),
+                )
+            })
+            .unwrap();
+
+        let stored = env
+            .as_contract(&contract_id, || get_market(&env, market_id))
+            .unwrap();
+        assert_eq!(stored.token, token);
+
+        // The stake is moved in the market's stored token, with no caller-supplied token.
+        let participant = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&participant, &1000);
+        env.as_contract(&contract_id, || {
+            place_prediction(&env, participant.clone(), market_id, PredictionSide::Yes, 1000)
+                .unwrap();
+        });
+        let token_client = soroban_sdk::token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&participant), 0);
+        assert_eq!(token_client.balance(&contract_id), 1000);
     }
 }

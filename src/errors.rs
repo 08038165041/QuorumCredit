@@ -77,6 +77,10 @@ pub fn contract_error_meta(env: &Env, err: ContractError) -> (String, String) {
             String::from_str(env, "ContractPaused"),
             String::from_str(env, "Contract is paused. Wait for an admin to call unpause()."),
         ),
+        ContractError::StakeNotUnlocked => (
+            String::from_str(env, "StakeNotUnlocked"),
+            String::from_str(env, "SBT stake is still locked. Wait until the unlock time before claiming."),
+        ),
         ContractError::LoanPastDeadline => (
             String::from_str(env, "LoanPastDeadline"),
             String::from_str(env, "Repayment deadline has passed. Use slash() to mark default."),
@@ -376,10 +380,10 @@ pub fn contract_error_meta(env: &Env, err: ContractError) -> (String, String) {
         ContractError::LoanNotExpired => (
             String::from_str(env, "LoanNotExpired"),
             String::from_str(env, "The loan has not reached its deadline yet."),
+        ),
         ContractError::NotInitialized => (
             String::from_str(env, "NotInitialized"),
             String::from_str(env, "Contract has not been initialized. Call initialize() first."),
-        ),
         ),
         _ => (
             String::from_str(env, "UnknownError"),
@@ -576,6 +580,14 @@ EmergencyBypassNotAuthorised = 131,
     CooldownBypassAlreadyApproved = 176,
     /// Insufficient admin approvals for cooldown bypass (need 2/3).
     CooldownBypassInsufficientApprovals = 177,
+    /// Cooldown bypass `reason` exceeds the maximum allowed length.
+    CooldownBypassReasonTooLong = 266,
+    /// Cooldown bypass request or approval has passed its validity window.
+    CooldownBypassExpired = 267,
+    /// Treasury payout transfer to the recipient failed; proposal left unexecuted.
+    TreasuryTransferFailed = 268,
+    /// Voter has no active vouched stake and cannot vote on treasury proposals.
+    NoVouchedStake = 269,
     /// Cross-collateral pool not found.
     CollateralPoolNotFound = 132,
     /// Cross-collateral pool is already active (has an assigned borrower).
@@ -822,6 +834,8 @@ EmergencyBypassNotAuthorised = 131,
     NoAdminsConfigured = 250,
     /// Issue #1907: a monotonic ID counter would overflow u64 on increment.
     CounterOverflow = 251,
+    /// Issue #2071: SBT stake claimed before its `unlocks_at` time (distinct from LoanPastDeadline).
+    StakeNotUnlocked = 266,
     // ── Issue #1631 / #1929: Credential Field-Level Permissions ──────────────
     /// An invalid field permission value (must be 0-3) was supplied.
     InvalidPermission = 252,

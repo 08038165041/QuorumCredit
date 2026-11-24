@@ -286,6 +286,11 @@ mod credential_batch_test;
 #[cfg(test)]
 mod credential_rate_limit_test;
 
+#[cfg(test)]
+mod sbt_marketplace_test;
+#[cfg(test)]
+mod sbt_insurance_test;
+
 pub use errors::ContractError;
 pub use types::*;
 

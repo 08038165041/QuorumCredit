@@ -395,7 +395,6 @@ pub fn contract_error_meta(env: &Env, err: ContractError) -> (String, String) {
         ),
     }
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[contracterror]
